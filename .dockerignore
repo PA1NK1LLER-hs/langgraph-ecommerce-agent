@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data (mounted as volumes in production)
+data/
+*.db
+*.sqlite
+
+# Git
+.git/
+.gitignore
+
+# Environment (use docker-compose env vars or --env-file)
+.env.local
+.env.*.local
+
+# Tests
+tests/
+test_*.py
+
+# CI / DevOps
+.github/
+.gitlab-ci.yml
+*.md
+LICENSE
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.dockerignore

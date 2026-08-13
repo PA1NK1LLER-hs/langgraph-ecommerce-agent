@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+:root {
+  --apple-blue: #007AFF;
+  --apple-green: #34C759;
+  --apple-red: #FF3B30;
+  --apple-gray: #8E8E93;
+  --apple-bg: #F5F5F7;
+  --apple-card: #FFFFFF;
+  --apple-border: rgba(0,0,0,.06);
+  --apple-text: #1D1D1F;
+  --apple-text-secondary: #86868B;
+}
+
+* { scrollbar-width: thin; scrollbar-color: #D1D1D6 transparent; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: var(--apple-bg);
+  color: var(--apple-text);
+  letter-spacing: -0.01em;
+}
+
+/* Smooth page transitions */
+.fade-enter-active, .fade-leave-active { transition: opacity .25s ease; }
+.fade-enter-from, .fade-leave-to { opacity: 0; }
+
+/* Glass effect */
+.glass {
+  background: rgba(255,255,255,.72);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+}
+
+/* Message bubble animation */
+@keyframes messageIn {
+  from { opacity: 0; transform: translateY(8px) scale(.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.msg-in { animation: messageIn .25s ease-out; }
+
+/* Typing dots */
+@keyframes dotPulse {
+  0%, 60%, 100% { transform: translateY(0); opacity: .35; }
+  30% { transform: translateY(-4px); opacity: 1; }
+}
+.typing-dot {
+  width: 5px; height: 5px;
+  background: var(--apple-gray);
+  border-radius: 50%;
+  display: inline-block;
+  animation: dotPulse 1.2s infinite;
+}
+.typing-dot:nth-child(2) { animation-delay: .2s; }
+.typing-dot:nth-child(3) { animation-delay: .4s; }

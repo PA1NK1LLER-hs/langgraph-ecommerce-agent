@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LangGraph Agent — AI 助手</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #22262f;
+    --border: #2a2e3a;
+    --text: #e1e4eb;
+    --text2: #8b90a0;
+    --accent: #4f8fff;
+    --accent2: #6c5ce7;
+    --green: #00c853;
+    --red: #ff5252;
+    --orange: #ff9100;
+    --radius: 10px;
+    --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    --mono: 'Cascadia Code', 'Fira Code', monospace;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    overflow: hidden;
+  }
+
+  /* ── Sidebar ── */
+  #sidebar {
+    width: 280px;
+    min-width: 280px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+  #sidebar .logo {
+    padding: 20px 18px 14px;
+    font-size: 17px;
+    font-weight: 700;
+    border-bottom: 1px solid var(--border);
+    letter-spacing: -0.3px;
+  }
+  #sidebar .logo span { color: var(--accent); }
+  .panel { border-bottom: 1px solid var(--border); }
+  .panel-header {
+    padding: 12px 18px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text2);
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    transition: background .15s;
+  }
+  .panel-header:hover { background: var(--surface2); }
+  .panel-body { padding: 8px 14px 14px; display: none; }
+  .panel.open .panel-body { display: block; }
+
+  .tool-tag {
+    display: inline-block;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 3px 8px;
+    margin: 2px 3px 2px 0;
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--text2);
+  }
+  .tool-tag.rpa { border-color: var(--orange); color: var(--orange); }
+  .tool-tag.mcp { border-color: var(--accent); color: var(--accent); }
+  .tool-tag.core { border-color: var(--green); color: var(--green); }
+
+  .mini-btn {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 5px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 11px;
+    margin: 2px 4px 2px 0;
+    transition: all .15s;
+  }
+  .mini-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ── Main Chat Area ── */
+  #main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  #chat-header {
+    padding: 14px 22px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text2);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  #status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    display: inline-block;
+    margin-right: 6px;
+  }
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .msg {
+    max-width: 85%;
+    animation: fadeIn .2s ease;
+  }
+  @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+  .msg.user {
+    align-self: flex-end;
+    background: var(--accent);
+    color: #fff;
+    border-radius: var(--radius) var(--radius) 3px var(--radius);
+    padding: 10px 15px;
+  }
+  .msg.assistant {
+    align-self: flex-start;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius) var(--radius) var(--radius) 3px;
+    padding: 12px 16px;
+    line-height: 1.6;
+  }
+  .msg.assistant pre {
+    background: #0d1117;
+    border-radius: 6px;
+    padding: 12px;
+    overflow-x: auto;
+    margin: 8px 0;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .msg.assistant code {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: rgba(255,255,255,0.06);
+    padding: 2px 5px;
+    border-radius: 3px;
+  }
+  .msg.system {
+    align-self: center;
+    font-size: 11px;
+    color: var(--text2);
+    padding: 4px 12px;
+    border-radius: 10px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+  }
+  .msg.tool {
+    align-self: flex-start;
+    font-size: 11px;
+    color: var(--text2);
+    background: var(--surface2);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-family: var(--mono);
+    border-left: 3px solid var(--accent);
+    max-width: 70%;
+    overflow-x: auto;
+  }
+  .msg.tool.error { border-left-color: var(--red); }
+  .msg .model-badge {
+    font-size: 10px;
+    color: var(--accent);
+    margin-bottom: 4px;
+  }
+
+  /* ── Input Area ── */
+  #input-area {
+    padding: 14px 22px 18px;
+    border-top: 1px solid var(--border);
+  }
+  #input-row {
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+  }
+  #chat-input {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 15px;
+    color: var(--text);
+    font-size: 14px;
+    font-family: var(--font);
+    resize: none;
+    min-height: 44px;
+    max-height: 150px;
+    outline: none;
+    transition: border-color .15s;
+  }
+  #chat-input:focus { border-color: var(--accent); }
+  #send-btn {
+    background: var(--accent);
+    border: none;
+    color: #fff;
+    width: 44px; height: 44px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 18px;
+    transition: all .15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #send-btn:hover { filter: brightness(1.15); }
+  #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .hint-row {
+    margin-top: 8px;
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .hint-row button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text2);
+    padding: 3px 10px;
+    border-radius: 12px;
+    cursor: pointer;
+    font-size: 11px;
+    transition: all .15s;
+  }
+  .hint-row button:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* Loading dots */
+  .typing { display: flex; gap: 4px; padding: 4px 0; }
+  .typing span { width: 6px; height: 6px; background: var(--text2); border-radius: 50%; animation: bounce 1.2s infinite; }
+  .typing span:nth-child(2) { animation-delay: .2s; }
+  .typing span:nth-child(3) { animation-delay: .4s; }
+  @keyframes bounce { 0%,60%,100% { transform: translateY(0); } 30% { transform: translateY(-6px); } }
+
+  /* Stats row */
+  .kb-item { font-size: 12px; padding: 3px 0; color: var(--text2); }
+  .kb-item strong { color: var(--text); }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* Responsive */
+  @media (max-width: 768px) {
+    #sidebar { display: none; }
+    .msg { max-width: 95%; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ═══ Sidebar ═══ -->
+<aside id="sidebar">
+  <div class="logo"><span>◈</span> LangGraph Agent</div>
+
+  <div class="panel open" id="panel-status">
+    <div class="panel-header" onclick="togglePanel('panel-status')">系统状态 ▾</div>
+    <div class="panel-body">
+      <div style="font-size:12px;color:var(--text2);" id="status-info">加载中...</div>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-tools">
+    <div class="panel-header" onclick="togglePanel('panel-tools')">可用工具 <span id="tool-count">—</span></div>
+    <div class="panel-body" id="tools-list">加载中...</div>
+  </div>
+
+  <div class="panel" id="panel-kb">
+    <div class="panel-header" onclick="togglePanel('panel-kb')">知识库 <span id="kb-chunks">—</span></div>
+    <div class="panel-body" id="kb-stats">
+      <button class="mini-btn" onclick="loadKBStats()">刷新统计</button>
+      <div id="kb-detail" style="margin-top:6px;"></div>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-memory">
+    <div class="panel-header" onclick="togglePanel('panel-memory')">记忆管理 <span id="mem-count">—</span></div>
+    <div class="panel-body">
+      <button class="mini-btn" onclick="loadMemories()">刷新</button>
+      <div id="mem-list" style="margin-top:6px;font-size:11px;color:var(--text2);"></div>
+    </div>
+  </div>
+</aside>
+
+<!-- ═══ Main Chat ═══ -->
+<main id="main">
+  <div id="chat-header">
+    <div><span id="status-dot"></span><span id="header-text">Agent 就绪</span></div>
+    <div style="font-size:11px;">
+      <button class="mini-btn" onclick="wsSend({message:'/reset'})">新对话</button>
+    </div>
+  </div>
+
+  <div id="messages">
+    <div class="msg system">欢迎使用 LangGraph AI 助手 — 支持知识库检索、联网搜索、代码执行、RPA自动化</div>
+  </div>
+
+  <div id="input-area">
+    <div id="input-row">
+      <textarea id="chat-input" rows="1" placeholder="输入消息... (Enter 发送，Shift+Enter 换行)"
+        onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage();}"></textarea>
+      <button id="send-btn" onclick="sendMessage()">▶</button>
+    </div>
+    <div class="hint-row">
+      <button onclick="wsSend({message:'/tools'})">/tools 查看工具</button>
+      <button onclick="wsSend({message:'/reset'})">/reset 新对话</button>
+    </div>
+  </div>
+</main>
+
+<!-- ═══ Script ═══ -->
+<script>
+// ── 状态 ──
+let ws = null;
+let msgContainer = document.getElementById('messages');
+let currentAssistantMsg = null;
+let toolCount = 0;
+
+// ── WebSocket 连接 ──
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/chat`);
+
+  ws.onopen = () => {
+    console.log('WS connected');
+    document.getElementById('status-dot').style.background = 'var(--green)';
+    document.getElementById('header-text').textContent = 'Agent 就绪';
+  };
+
+  ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    switch (data.type) {
+      case 'text':
+        if (!currentAssistantMsg) {
+          currentAssistantMsg = addMsg('assistant', '');
+          if (data.model) {
+            const badge = document.createElement('div');
+            badge.className = 'model-badge';
+            badge.textContent = `[${data.model}]`;
+            currentAssistantMsg.insertBefore(badge, currentAssistantMsg.firstChild);
+          }
+        }
+        currentAssistantMsg.appendChild(document.createTextNode(data.content));
+        scrollBottom();
+        break;
+
+      case 'tool_call':
+        addMsg('tool', `🔧 调用: <b>${data.tool}</b>(${escapeHtml(data.args)})`);
+        break;
+
+      case 'tool_result':
+        const cls = data.error ? 'tool error' : 'tool';
+        const prefix = data.error ? '✗' : '✓';
+        addMsg(cls, `${prefix} ${data.tool}: ${escapeHtml(data.content)}`);
+        break;
+
+      case 'plan':
+        addMsg('system', `📋 计划: ${escapeHtml(data.content)}`);
+        break;
+
+      case 'system':
+        addMsg('system', data.content);
+        break;
+
+      case 'error':
+        addMsg('system', `❌ ${escapeHtml(data.content)}`);
+        currentAssistantMsg = null;
+        break;
+
+      case 'done':
+        currentAssistantMsg = null;
+        document.getElementById('send-btn').disabled = false;
+        document.getElementById('chat-input').disabled = false;
+        document.getElementById('chat-input').focus();
+        break;
+    }
+  };
+
+  ws.onclose = () => {
+    document.getElementById('status-dot').style.background = 'var(--red)';
+    document.getElementById('header-text').textContent = '连接断开 — 3秒后重连';
+    currentAssistantMsg = null;
+    setTimeout(connectWS, 3000);
+  };
+
+  ws.onerror = () => {
+    document.getElementById('status-dot').style.background = 'var(--orange)';
+    document.getElementById('header-text').textContent = '连接中...';
+  };
+}
+
+// ── 消息渲染 ──
+function addMsg(type, content) {
+  const div = document.createElement('div');
+  div.className = `msg ${type}`;
+  div.innerHTML = content;
+  msgContainer.appendChild(div);
+  scrollBottom();
+  return div;
+}
+
+function scrollBottom() {
+  msgContainer.scrollTop = msgContainer.scrollHeight;
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// ── 发送消息 ──
+function sendMessage() {
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  addMsg('user', escapeHtml(text));
+  input.value = '';
+  input.style.height = 'auto';
+  document.getElementById('send-btn').disabled = true;
+  document.getElementById('chat-input').disabled = true;
+
+  // 显示打字动画
+  const typingDiv = document.createElement('div');
+  typingDiv.className = 'msg assistant';
+  typingDiv.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
+  typingDiv.id = 'typing-indicator';
+  msgContainer.appendChild(typingDiv);
+  scrollBottom();
+
+  ws.send(JSON.stringify({ message: text }));
+}
+
+function wsSend(obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    addMsg('system', 'WebSocket 未连接，请等待重连');
+    return;
+  }
+  ws.send(JSON.stringify(obj));
+}
+
+// ── 移除打字动画 ──
+const observer = new MutationObserver(() => {
+  const typing = document.getElementById('typing-indicator');
+  if (typing && currentAssistantMsg) {
+    typing.remove();
+  }
+});
+observer.observe(msgContainer, { childList: true });
+
+// ── Sidebar Panels ──
+function togglePanel(id) {
+  document.getElementById(id).classList.toggle('open');
+}
+
+// ── API 调用 ──
+async function loadStatus() {
+  try {
+    const r = await fetch('/api/health');
+    const d = await r.json();
+    document.getElementById('status-info').innerHTML =
+      `状态: ${d.status}<br>用户: ${d.current_user}<br>时间: ${new Date(d.timestamp).toLocaleTimeString()}`;
+  } catch(e) {
+    document.getElementById('status-info').textContent = 'API 不可达';
+  }
+}
+
+async function loadTools() {
+  try {
+    const r = await fetch('/api/tools');
+    const d = await r.json();
+    document.getElementById('tool-count').textContent = d.count;
+    let html = '';
+    d.tools.forEach(t => {
+      let cls = 'tool-tag core';
+      if (t.name.startsWith('mcp_')) cls = 'tool-tag mcp';
+      if (t.name.startsWith('rpa_')) cls = 'tool-tag rpa';
+      html += `<span class="${cls}" title="${escapeHtml(t.description)}">${t.name}</span>`;
+    });
+    document.getElementById('tools-list').innerHTML = html;
+    toolCount = d.count;
+  } catch(e) { document.getElementById('tools-list').textContent = '加载失败'; }
+}
+
+async function loadKBStats() {
+  try {
+    const r = await fetch('/api/kb/stats');
+    const d = await r.json();
+    document.getElementById('kb-chunks').textContent = d.total_chunks;
+    let html = `<div class="kb-item"><strong>${d.total_chunks}</strong> 分块 · <strong>${d.sources?.length||0}</strong> 来源</div>`;
+    (d.sources||[]).slice(0,8).forEach(s => {
+      html += `<div class="kb-item">[${s.chunks}] ${escapeHtml(s.source||'?')}</div>`;
+    });
+    document.getElementById('kb-detail').innerHTML = html;
+  } catch(e) { console.error(e); }
+}
+
+async function loadMemories() {
+  try {
+    const r = await fetch('/api/memories');
+    const d = await r.json();
+    document.getElementById('mem-count').textContent = d.count||0;
+    let html = '';
+    (d.results||[]).slice(0,10).forEach(m => {
+      html += `<div class="kb-item">• ${escapeHtml(m.memory||'')}</div>`;
+    });
+    if (!d.results?.length) html = '<div class="kb-item">暂无记忆</div>';
+    document.getElementById('mem-list').innerHTML = html;
+  } catch(e) { console.error(e); }
+}
+
+// ── 初始化 ──
+connectWS();
+loadStatus();
+loadTools();
+loadKBStats();
+loadMemories();
+setInterval(loadStatus, 30000);
+
+// auto-resize textarea
+document.getElementById('chat-input').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 150) + 'px';
+});
+</script>
+</body>
+</html>

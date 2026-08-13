@@ -1,0 +1,83 @@
+[project]
+name = "langgraph-agent"
+version = "0.1.0"
+description = "LangGraph-based AI assistant with RAG knowledge base and RPA automation"
+requires-python = ">=3.11"
+dependencies = [
+    # ── Agent 框架 ──
+    "langgraph>=0.4.0",
+    "langchain>=0.3.0",
+    "langchain-openai>=0.3.0",
+    "langgraph-checkpoint>=2.0.0",
+    "langgraph-checkpoint-sqlite>=2.0.0",
+    # ── RAG & 向量 ──
+    "lightrag-hku>=1.4.0",
+    "qdrant-client>=1.9.0",
+    "rank-bm25>=0.2.0",
+    # ── LLM & Embedding ──
+    "openai>=1.0.0",
+    "dashscope>=1.25.0",
+    "tiktoken>=0.5.0",
+    # ── Web 框架 ──
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-multipart>=0.0.9",
+    # ── 认证 ──
+    "python-jose[cryptography]>=3.3.0",
+    "bcrypt>=4.0.0",
+    # ── 数据库 ──
+    "sqlalchemy[asyncio]>=2.0.0",
+    "asyncpg>=0.29.0",
+    "aiosqlite>=0.20.0",
+    # ── 记忆 ──
+    "mem0ai>=0.1.0",
+    # ── 缓存 & 限流 ──
+    "redis>=5.0.0",
+    # ── 文档解析 ──
+    "trafilatura>=1.12.0",
+    "pdfplumber>=0.11.0",
+    "python-pptx>=0.6.0",
+    "python-docx>=1.1.0",
+    "beautifulsoup4>=4.12.0",
+    # ── 数据处理 ──
+    "numpy>=1.26.0",
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+    # ── MCP 协议 ──
+    "mcp>=1.0.0",
+    # ── 工具 ──
+    "python-dotenv>=1.0.0",
+    "httpx>=0.28.0",
+    "neo4j>=5.0.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+    "requests>=2.28.0",
+    # ── RPA (可选依赖) ──
+    "playwright>=1.40.0",
+    "playwright-stealth>=1.0.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-mock>=3.12.0",
+]
+rpa = ["playwright>=1.40.0", "playwright-stealth>=1.0.6", "openpyxl>=3.1.0", "pandas>=2.0.0"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+exclude = ["src/data/", ".venv/", "venv/", "*.egg-info/"]
+extend-exclude = ["src/data/*"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/skills/ziniao_playwright_http_py3.py" = ["F401", "F841", "E402", "E722", "F541", "F811"]
+"src/skills/rpa_amazon_get_review.py" = ["F401", "F841"]
+"src/rag/embedding.py" = ["F821"]
+
+[tool.pytest.ini_options]
+markers = [
+    "asyncio: async test (requires pytest-asyncio)",
+    "integration: integration test (requires external services)",
+]

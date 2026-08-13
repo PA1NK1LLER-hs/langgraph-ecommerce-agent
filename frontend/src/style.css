@@ -1,0 +1,264 @@
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════
+   Monochrome Glass Design System — 黑白灰 · 透明 · 玻璃磨砂
+   圆角：控件 12px / 卡片 18px / 按钮 10px
+   阴影：弥散轻阴影；毛玻璃贯穿侧边栏 / 顶栏 / 卡片 / 悬浮输入区
+   ═══════════════════════════════════════════════════ */
+
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+    "Helvetica Neue", Arial, sans-serif;
+
+  /* 单色强调：墨黑主按钮 / 激活态；soft 为黑色低透明度面 */
+  --color-accent: #1D1D1F;
+  --color-accent-hover: #3A3A3C;
+  --color-accent-soft: rgba(0, 0, 0, 0.05);
+
+  /* 文字：近黑 / 中灰 / 浅灰 */
+  --color-ink: #1D1D1F;
+  --color-ink-2: #6E6E73;
+  --color-ink-3: #AEAEB2;
+
+  /* 发丝级分割线与半透明浅灰面 */
+  --color-line: rgba(0, 0, 0, 0.08);
+  --color-surface: rgba(0, 0, 0, 0.04);
+
+  /* 仅用于功能状态（连接 / 执行状态 / 危险操作），不作装饰用色 */
+  --color-ok: #34C759;
+  --color-warn: #FF9F0A;
+  --color-danger: #FF3B30;
+
+  /* 圆角规范 */
+  --radius-btn: 10px;
+  --radius-ctrl: 12px;
+  --radius-card: 18px;
+
+  /* 柔和轻量化弥散阴影 */
+  --shadow-soft: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 12px rgba(16, 24, 40, 0.05);
+  --shadow-card: 0 1px 3px rgba(16, 24, 40, 0.05), 0 6px 20px rgba(16, 24, 40, 0.06);
+  --shadow-float: 0 2px 8px rgba(16, 24, 40, 0.06), 0 12px 32px rgba(16, 24, 40, 0.08);
+}
+
+/* ═══ 基础 ═══ */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.14) transparent;
+}
+
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* 极淡单色环境渐变：给毛玻璃提供可扩散的层次，保持黑白灰克制 */
+  background:
+    radial-gradient(1100px 700px at 8% -15%, rgba(0, 0, 0, 0.055), transparent 60%),
+    radial-gradient(900px 650px at 105% 115%, rgba(0, 0, 0, 0.05), transparent 55%),
+    linear-gradient(180deg, #F7F7F9 0%, #F0F0F3 100%);
+  background-attachment: fixed;
+  color: var(--color-ink);
+  letter-spacing: -0.011em;
+  overflow: hidden;
+}
+
+::selection {
+  background: rgba(0, 0, 0, 0.08);
+  color: var(--color-ink);
+}
+
+/* ═══ Scrollbar ═══ */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.12);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(0, 0, 0, 0.22); }
+
+/* ═══ 毛玻璃层级 ═══
+   .glass        固定 chrome（侧边栏 / 顶栏）——内容在下方滚动，磨砂最明显
+   .glass-strong 悬浮控件（输入区 / 对话框）
+   .glass-card   内容区半透明玻璃卡片——省略 backdrop-filter，避免长列表大量
+                 独立模糊层带来的 GPU 开销；半透明白 + 发丝边已具玻璃质感   */
+
+.glass {
+  background: rgba(255, 255, 255, 0.52);
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+}
+.glass-strong {
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(28px) saturate(1.4);
+  -webkit-backdrop-filter: blur(28px) saturate(1.4);
+}
+.glass-card {
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+}
+
+/* ═══ 消息入场（克制：位移小、时长短、无弹跳）═══ */
+@keyframes messageIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.msg-in { animation: messageIn 0.25s cubic-bezier(0.25, 0.8, 0.35, 1); }
+
+/* ═══ 输入中指示点（柔和呼吸）═══ */
+@keyframes dotPulse {
+  0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
+  30%          { opacity: 0.8; transform: translateY(-2px); }
+}
+.typing-dot {
+  width: 5px; height: 5px;
+  background: var(--color-ink-3);
+  border-radius: 50%;
+  display: inline-block;
+  animation: dotPulse 1.2s infinite;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+/* ═══ 骨架屏 ═══ */
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, #ECECF0 25%, #F7F7F9 50%, #ECECF0 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+/* ═══ 点击反馈（柔和缩放）═══ */
+.scale-press {
+  transition: transform 0.15s cubic-bezier(0.25, 0.8, 0.35, 1);
+}
+.scale-press:active { transform: scale(0.98); }
+
+/* ═══ 焦点环（单色）═══ */
+.focus-ring:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.12);
+  border-color: var(--color-ink);
+}
+
+/* ═══════════════════════════════════════════════════
+   Markdown 正文样式（单色、留白宽松）
+   ═══════════════════════════════════════════════════ */
+.markdown-body h1, .markdown-body h2, .markdown-body h3,
+.markdown-body h4, .markdown-body h5, .markdown-body h6 {
+  font-weight: 700;
+  line-height: 1.3;
+  margin: 1.2em 0 0.5em;
+  color: var(--color-ink);
+}
+.markdown-body h1:first-child, .markdown-body h2:first-child,
+.markdown-body h3:first-child, .markdown-body h4:first-child { margin-top: 0; }
+.markdown-body h1 { font-size: 1.35em; border-bottom: 1px solid var(--color-line); padding-bottom: 0.3em; }
+.markdown-body h2 { font-size: 1.18em; border-bottom: 1px solid var(--color-line); padding-bottom: 0.25em; }
+.markdown-body h3 { font-size: 1.06em; }
+.markdown-body h4 { font-size: 1em; color: var(--color-ink-2); }
+
+.markdown-body p { margin: 0.55em 0; }
+.markdown-body p:first-child { margin-top: 0; }
+.markdown-body p:last-child { margin-bottom: 0; }
+
+.markdown-body ul, .markdown-body ol {
+  padding-left: 1.5em;
+  margin: 0.5em 0;
+}
+.markdown-body li { margin: 0.25em 0; }
+.markdown-body ul li::marker { color: var(--color-ink-3); }
+
+.markdown-body a {
+  color: var(--color-ink);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  transition: opacity 0.15s;
+}
+.markdown-body a:hover { opacity: 0.6; }
+
+.markdown-body strong { font-weight: 700; color: var(--color-ink); }
+.markdown-body em { font-style: italic; }
+
+/* ── 行内代码 ── */
+.markdown-body code:not(pre code) {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--color-ink);
+  padding: 0.15em 0.4em;
+  border-radius: 5px;
+  font-size: 0.88em;
+  font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
+  font-weight: 500;
+}
+
+/* ── 代码块 ── */
+.markdown-body pre {
+  background: #F5F5F7;
+  color: var(--color-ink);
+  padding: 14px 16px;
+  border-radius: var(--radius-ctrl);
+  overflow-x: auto;
+  margin: 0.8em 0;
+  line-height: 1.55;
+  font-size: 0.85em;
+  font-family: "SF Mono", "Cascadia Code", Consolas, monospace;
+  border: 1px solid var(--color-line);
+}
+.markdown-body pre code {
+  background: none;
+  color: inherit;
+  padding: 0;
+  font-size: inherit;
+  font-weight: 400;
+  border-radius: 0;
+}
+
+/* ── 引用块 ── */
+.markdown-body blockquote {
+  border-left: 3px solid rgba(0, 0, 0, 0.18);
+  padding: 0.4em 0.8em;
+  margin: 0.6em 0;
+  background: rgba(0, 0, 0, 0.03);
+  border-radius: 0 8px 8px 0;
+  color: var(--color-ink-2);
+}
+
+/* ── 表格 ── */
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.8em 0;
+  font-size: 0.9em;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.markdown-body th {
+  background: rgba(0, 0, 0, 0.04);
+  font-weight: 600;
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-line);
+  color: var(--color-ink);
+  font-size: 0.85em;
+}
+.markdown-body td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-line);
+  color: var(--color-ink-2);
+}
+.markdown-body tr:last-child td { border-bottom: none; }
+
+/* ── 分割线 / 图片 ── */
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid var(--color-line);
+  margin: 1em 0;
+}
+.markdown-body img {
+  max-width: 100%;
+  border-radius: var(--radius-btn);
+  margin: 0.5em 0;
+}

@@ -1,0 +1,54 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude
+.claude/
+
+# Data / Logs
+data/
+src/data/code_logs/
+src/data/chroma/
+src/data/chroma_server/
+src/data/lightrag/
+src/data/user_memory/
+src/data/neo4j/
+src/data/postgres/
+src/data/qdrant/
+*.log
+
+# SQLite / checkpoint files
+*.db
+*.db-shm
+*.db-wal
+
+# Ruff cache
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+
