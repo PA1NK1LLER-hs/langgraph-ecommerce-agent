@@ -24,6 +24,7 @@ from .core import (
     get_system_prompt,
     get_all_tools,
     get_core_tools,
+    set_session_prompt_tokens,
 )
 from .specialists import (
     SUPERVISOR_PROMPT,
@@ -32,13 +33,16 @@ from .specialists import (
     match_specialist_tools,
     get_specialist,
 )
-from .utils import extract_user_text, is_tool_error, extract_first_json
-from .approval import classify_tool_risk, build_approval_payload, get_approval_mode
+from .utils import extract_user_text, content_to_text, messages_have_image, is_tool_error, extract_first_json
+from .context_budget import messages_tokens
+from .approval import classify_tool_risk, build_approval_payload, get_approval_mode, check_command_policy
 from config import (
     LLM_MODEL,
     LLM_FLASH_MODEL,
     WEB_SEARCH_ENABLED,
     SECURITY_LLM_GUARD,
+    RAG_TOP_K,
+    RAG_MODE,
     display_model_name,
 )
 from rag import async_search_knowledge
@@ -106,7 +110,8 @@ def _should_continue(state: AgentState) -> Literal["tools", "reflect", "__end__"
 
 
 # ── RPA 工具前缀（用于历史检测和模型路由）──
-_RPA_TOOL_PREFIXES = ("rpa_", "amazon_", "mcp_docker_")
+# 含 submit_rpa_：提交任务后跨轮保留 RPA 工具绑定（用户接着问任务进度）。
+_RPA_TOOL_PREFIXES = ("mcp_rpa_", "rpa_", "amazon_", "mcp_docker_", "submit_rpa_")
 
 
 def _sanitize_messages_for_api(messages: list) -> list:
@@ -161,8 +166,87 @@ def _sanitize_messages_for_api(messages: list) -> list:
     return cleaned
 
 
-def _route_after_classify(state: AgentState) -> Literal["supervisor", "query_rewrite", "planner", "agent"]:
-    """分类后路由：complex → supervisor（多 Agent 委派），需要 RAG → 先改写查询词再检索，其余 → agent。"""
+async def _replace_images_with_descriptions(messages: list, question: str = "") -> list:
+    """把多模态消息里的图片块替换为视觉模型的文字描述。
+
+    主模型（deepseek-v4-flash/pro）是纯文本模型，直接收到 image_url 块会
+    返回 400（"This model does not support image"），且回退链上也都是文本
+    模型，最终整轮报错。因此在喂给主模型前，先把图片交给视觉模型
+    （deepseek-v4-flash-vision-exp）转成文字描述，主模型基于描述推理。
+
+    该函数对已转换的消息幂等（转换后无 image_url 块，直接原样返回），
+    因此同一图片在后续轮次不会重复触发视觉调用……除首次外的每轮仍会
+    从 checkpoint 载入原始 image_url 块并重新转换（视觉调用会按轮次重复）。
+    视觉调用失败/未启用时，图片块降级为占位文本，绝不让主链路因图片报错。
+
+    Args:
+        messages: 原始消息列表（含可能的 image_url 块）。
+        question: 用户本轮问题文本，作为视觉模型聚焦描述的引导。
+
+    Returns:
+        转换后的新消息列表（原列表不被修改）。
+    """
+    from .vision import describe_image, DEFAULT_DESCRIBE_PROMPT
+
+    result: list = []
+    for m in messages:
+        content = getattr(m, "content", None)
+        if not isinstance(content, list):
+            result.append(m)
+            continue
+
+        image_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "image_url"]
+        if not image_blocks:
+            result.append(m)
+            continue
+
+        # 该消息里与图片并列的纯文本块（通常是用户的问题/说明）
+        local_text = " ".join(
+            str(b.get("text", "")) for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+        ).strip()
+        guiding = (local_text or question).strip()
+
+        new_content: list = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image_url":
+                uri = block.get("image_url", {}).get("url", "")
+                if guiding:
+                    prompt = f"{guiding}\n{DEFAULT_DESCRIBE_PROMPT}"
+                else:
+                    prompt = DEFAULT_DESCRIBE_PROMPT
+                desc = await describe_image(uri, prompt=prompt)
+                if desc:
+                    new_content.append({
+                        "type": "text",
+                        "text": (
+                            "[图片内容已识别，请直接据此回答，无需再调用图片理解工具]"
+                            f"\n{desc}"
+                        ),
+                    })
+                else:
+                    new_content.append({
+                        "type": "text",
+                        "text": "[图片内容未能识别（视觉模型不可用），请告知用户无法解析该图片]",
+                    })
+            else:
+                new_content.append(block)
+
+        # 用同类型消息重建，避免改变 LangChain 消息类型
+        result.append(type(m)(content=new_content))
+    return result
+
+
+def _route_after_classify(state: AgentState) -> Literal["supervisor", "query_rewrite", "agent"]:
+    """分类后路由：complex → supervisor（多 Agent 委派），需要 RAG → 先改写查询词再检索，其余 → agent。
+
+    含图片（多模态）的消息直接进 agent：视觉描述已在 call_model 里由
+    ``_replace_images_with_descriptions`` 注入上下文，无需 RAG 检索，
+    也无需 supervisor/planner 规划（否则"描述这张图片"会被规划器劫持，
+    输出步骤计划而非直接回答）。
+    """
+    if messages_have_image(state.get("messages", [])):
+        return "agent"
     if state.get("needs_rag"):
         return "query_rewrite"
     intent = state.get("intent", "complex")
@@ -173,9 +257,11 @@ def _route_after_classify(state: AgentState) -> Literal["supervisor", "query_rew
     return "agent"
 
 
-def _route_after_rag(state: AgentState) -> Literal["supervisor", "planner", "agent"]:
+def _route_after_rag(state: AgentState) -> Literal["supervisor", "agent"]:
     """RAG 检索后路由：根据意图分发到对应节点。"""
     intent = state.get("intent", "complex")
+    if messages_have_image(state.get("messages", [])):
+        return "agent"
     if intent == "complex":
         return "supervisor"
     return "agent"
@@ -434,7 +520,20 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
             }
 
         messages = list(state["messages"])
+        # 图片是否出现在原始消息里（转换前判定，供缓存/路由跳过，见下）
+        _had_image = messages_have_image(messages)
         user_text = extract_user_text(messages)
+        # ── 上下文预算：把本会话已消耗 prompt token 透传给 get_context_remaining 工具 ──
+        _sc = state.get("session_costs") or {}
+        if isinstance(_sc, dict) and _sc.get("prompt_tokens") is not None:
+            set_session_prompt_tokens(int(_sc.get("prompt_tokens", 0)))
+        else:
+            set_session_prompt_tokens(messages_tokens(messages))
+        # ── 图片 → 文字描述：主模型是纯文本模型，先交给视觉模型转写 ──
+        if _had_image:
+            messages = await _replace_images_with_descriptions(messages, question=user_text)
+            # 转换后重取文本（占位图片已被替换为文字描述，但文本部分通常不变）
+            user_text = extract_user_text(messages) or user_text
         intent = state.get("intent", "complex")
         selected_tools = state.get("selected_tools", [])
         needs_rag = state.get("needs_rag", False)
@@ -571,6 +670,12 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
         if rag_context:
             # 数据已注入 prompt，不需要 LLM 再调工具搜索
             tools_to_bind = [t for t in tools_to_bind if getattr(t, "name", "") != "tool_search_knowledge"]
+        logger.info(
+            "RAG上下文注入: %s | 绑定工具(%d): %s",
+            "有" if rag_context else "无",
+            len(tools_to_bind),
+            [getattr(t, "name", "") for t in tools_to_bind],
+        )
 
         # （工具绑定延迟到调用时：运行时回退链中的每个模型都要按 tools_to_bind 单独绑定）
 
@@ -581,7 +686,11 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
             if specialist_suffix:
                 prompt += specialist_suffix
             if rag_context:
-                prompt = prompt + "\n\n" + rag_context
+                prompt = prompt + "\n\n" + (
+                    "## 已检索到的知识库内容（请直接使用，无需再次检索）\n"
+                    "以下内容已根据你的问题预先从知识库检索并注入到本条消息中。"
+                    "请直接基于这些内容回答，**不要再次调用 tool_search_knowledge 或任何知识库检索工具重复查询**。\n"
+                ) + rag_context
 
             # ── 注入被拒绝的工具调用上下文 ──
             denied = state.get("denied_tool_calls", [])
@@ -603,8 +712,9 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
         callbacks = get_callbacks()
 
         # ── 语义缓存：相似问题直接返回缓存结果（跳过 LLM 调用）──
+        # 图片问答跳过缓存：缓存键只有文本，跨图会串味
         _cached = None
-        if user_text and not need_rpa:
+        if user_text and not need_rpa and not _had_image:
             from cache.semantic_cache import get_cache
             _cache = get_cache()
             _cached = await _cache.get(user_text)
@@ -704,7 +814,7 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
 
         # ── 语义缓存：将非工具调用的最终回答写入缓存 ──
         if (
-            user_text and not need_rpa
+            user_text and not need_rpa and not _had_image
             and response.content and not getattr(response, "tool_calls", None)
         ):
             try:
@@ -758,6 +868,17 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
             tool_name = tc.get("name", "")
             tool = tools_by_name.get(tool_name)
             tc_id = tc.get("id", "")
+            logger.info("工具执行: %s args=%s", tool_name, _json.dumps(tc.get("args", {}), ensure_ascii=False)[:120])
+            # ── 防重复检索：rag_context 已注入时，模型无需（也不应）再调 tool_search_knowledge ──
+            if tool_name == "tool_search_knowledge" and state.get("rag_context"):
+                logger.info("已阻止重复检索 tool_search_knowledge（rag_context 已注入，直接回退使用上下文）")
+                return ToolMessage(
+                    content=_json.dumps({
+                        "status": "skipped",
+                        "message": "知识库内容已在上下文中提供，请直接基于它回答，无需再次检索。",
+                    }),
+                    tool_call_id=tc_id, name=tool_name,
+                )
             if tool_name in _blocked_names:
                 return ToolMessage(
                     content=_json.dumps({"status": "error", "message": f"权限不足: {tool_name} 需更高权限"}),
@@ -982,7 +1103,7 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
             recent_context = []
             for m in messages[-8:]:
                 role = "user" if isinstance(m, HumanMessage) else "assistant"
-                content = m.content if isinstance(m.content, str) else str(m.content)
+                content = content_to_text(m.content)
                 if content.strip():
                     recent_context.append(f"[{role}]: {content[:300]}")
 
@@ -1026,7 +1147,7 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
             return {"rag_context": "", "rag_citations": []}
 
         try:
-            rag_result = await async_search_knowledge(user_text, top_k=5, mode="dense")
+            rag_result = await async_search_knowledge(user_text, top_k=RAG_TOP_K, mode=RAG_MODE, use_rerank=False)
             if rag_result.get("status") == "success":
                 results = rag_result.get("results", [])
                 if results:
@@ -1248,6 +1369,10 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
             tool_name = tc.get("name", "")
             needs, level, reason = classify_tool_risk(tool_name, mode=approval_mode)
             if needs:
+                # 命令级策略：命中 forbidden 命令时单点升级原因（prefix_rule 引擎）
+                forbidden, forbid_reason = check_command_policy(tc.get("args", {}))
+                if forbidden:
+                    reason = forbid_reason
                 risky_calls.append({
                     "id": tc.get("id", ""),
                     "name": tool_name,
@@ -1503,13 +1628,13 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
     # 分类后路由：complex → supervisor（多 Agent），RAG → query_rewrite，其余 → agent
     graph.add_conditional_edges(
         "classify_intent", _route_after_classify,
-        {"supervisor": "supervisor", "query_rewrite": "query_rewrite", "planner": "planner", "agent": "agent"},
+        {"supervisor": "supervisor", "query_rewrite": "query_rewrite", "agent": "agent"},
     )
     graph.add_edge("query_rewrite", "search_rag")
     # RAG 检索完成后：complex → supervisor → planner → agent
     graph.add_conditional_edges(
         "search_rag", _route_after_rag,
-        {"supervisor": "supervisor", "planner": "planner", "agent": "agent"},
+        {"supervisor": "supervisor", "agent": "agent"},
     )
     # supervisor → planner（规划后再执行）
     graph.add_conditional_edges(

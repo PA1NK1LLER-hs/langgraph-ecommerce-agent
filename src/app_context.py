@@ -44,6 +44,10 @@ class AppContext:
         # ── Skill 工具缓存 ──
         self._skill_tools_cache: list | None = None
 
+        # ── RPA 是否由独立 MCP server 提供 ──
+        # True 时 skills 层跳过进程内 RPA 工具（避免与 mcp_rpa_* 重复）。
+        self._rpa_mcp_connected: bool = False
+
         # ── 线程安全 ──
         self._lock = threading.Lock()
 
@@ -82,6 +86,11 @@ class AppContext:
         with self._lock:
             self._mcp_tools.extend(tools)
 
+    def clear_mcp_tools(self) -> None:
+        """清空已注册的 MCP 工具（MCP 全量断开时调用，避免重连重复注册）。"""
+        with self._lock:
+            self._mcp_tools.clear()
+
     def get_mcp_tools(self) -> list:
         with self._lock:
             return list(self._mcp_tools)
@@ -95,6 +104,15 @@ class AppContext:
         with self._lock:
             self._skill_tools_cache = tools
 
+    # ── RPA MCP 连接状态 ──
+
+    def set_rpa_mcp_connected(self, connected: bool) -> None:
+        with self._lock:
+            self._rpa_mcp_connected = connected
+
+    def is_rpa_mcp_connected(self) -> bool:
+        return self._rpa_mcp_connected
+
     # ── Reset（测试用）──
 
     def reset(self) -> None:
@@ -105,6 +123,7 @@ class AppContext:
             self._checkpointer_closer = None
             self._mcp_tools.clear()
             self._skill_tools_cache = None
+            self._rpa_mcp_connected = False
 
 
 # ── 模块级单例 ──

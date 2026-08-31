@@ -47,6 +47,9 @@ src/data/qdrant/
 .DS_Store
 Thumbs.db
 
+# Runtime data (logs, uploads, episodic memory)
+/.data/
+
 # Frontend
 frontend/node_modules/
 frontend/dist/

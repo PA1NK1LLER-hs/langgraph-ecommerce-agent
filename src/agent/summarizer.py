@@ -1,18 +1,38 @@
 """对话摘要器 — 长对话历史自动压缩 + 滑动窗口管理。
 
-当消息数超过阈值（默认 20 条）时，自动将早期消息压缩为结构化摘要，
-保留最近 N 条完整消息（默认 10 条），在维持回答质量的同时降低 token 消耗。
+借鉴 Codex harness 的上下文管理（``compact.rs`` / ``context_window.rs``）：
+
+- **触发**：消息数超阈值 **或** 新增 token 超预算时触发（原来是只看消息数）。
+- **去重**：以 ``SUMMARY_PREFIX`` 开头的消息视为已摘要，收集「新消息」时跳过，
+  避免把已摘要内容反复喂回摘要模型（对应 Codex ``SUMMARY_PREFIX`` 去重语义）。
+- **清洗**：摘要前剥离图片块、跳过环境信息/安全提示等噪声 user 消息，
+  防止 base64 图片与噪声污染摘要模型的上下文。
+- **预算**：保留最近消息按 token 预算（而非固定条数），超限丢弃最老一条。
+
+原 API 契约（``should_summarize(messages)`` / ``summarize(messages, existing_summary)``）
+保持不变，新增参数均为可选，向后兼容。
 """
 
 from __future__ import annotations
 
 import logging
 
+from .context_budget import (
+    SUMMARY_PREFIX,
+    DEFAULT_KEEP_TOKENS,
+    DEFAULT_TRIGGER_TOKENS,
+    messages_tokens,
+    truncate_messages_to_budget,
+    strip_images,
+    is_noise_message,
+    has_summary_prefix,
+)
+
 logger = logging.getLogger(__name__)
 
-# 触发摘要的消息数阈值
+# 触发摘要的消息数阈值（兼容旧行为）
 TRIGGER_THRESHOLD = 20
-# 保留最近 N 条完整消息
+# 保留最近 N 条完整消息（兼容旧行为，token 预算未启用时的兜底）
 KEEP_RECENT = 10
 
 _SUMMARIZE_SYSTEM = """你是一个对话摘要助手。请将以下对话历史压缩为结构化摘要。
@@ -42,13 +62,61 @@ class ConversationSummarizer:
     TRIGGER_THRESHOLD: int = TRIGGER_THRESHOLD
     KEEP_RECENT: int = KEEP_RECENT
 
-    def __init__(self, trigger_threshold: int = TRIGGER_THRESHOLD, keep_recent: int = KEEP_RECENT):
+    def __init__(
+        self,
+        trigger_threshold: int = TRIGGER_THRESHOLD,
+        keep_recent: int = KEEP_RECENT,
+        trigger_tokens: int = DEFAULT_TRIGGER_TOKENS,
+        keep_tokens: int = DEFAULT_KEEP_TOKENS,
+    ):
         self.trigger_threshold = trigger_threshold
         self.keep_recent = keep_recent
+        self.trigger_tokens = trigger_tokens
+        self.keep_tokens = keep_tokens
 
-    def should_summarize(self, messages: list) -> bool:
-        """判断是否需要压缩消息历史。"""
-        return len(messages) >= self.trigger_threshold
+    def should_summarize(self, messages: list, growth_tokens: int | None = None) -> bool:
+        """判断是否需要压缩消息历史。
+
+        触发条件（任一满足即可）：
+        - 消息数达到阈值（兼容旧行为）；
+        - 新增对话 token 数超过预算（Codex 风格，避免单条超长消息撑爆上下文）。
+        """
+        if len(messages) >= self.trigger_threshold:
+            return True
+        if growth_tokens is not None and growth_tokens >= self.trigger_tokens:
+            return True
+        return False
+
+    def _collect_early(self, messages: list) -> tuple[list, list[str]]:
+        """切分「早期消息」与「最近消息」，并收集早期消息的纯文本行。
+
+        早期消息中的图片块被剥离、噪声消息被跳过、已摘要消息被跳过。
+
+        Returns:
+            (early_lines, 保留的最近消息列表)。
+        """
+        recent = messages[-self.keep_recent:] if len(messages) > self.keep_recent else messages
+        early = messages[:-self.keep_recent] if len(messages) > self.keep_recent else []
+
+        lines: list[str] = []
+        for m in early:
+            # 已摘要消息不再二次摘要
+            if has_summary_prefix(m):
+                continue
+            if is_noise_message(m):
+                continue
+            role = getattr(m, "type", "unknown")
+            content = strip_images(getattr(m, "content", ""))
+            if isinstance(content, list):
+                content = " ".join(
+                    str(c.get("text", "")) for c in content
+                    if isinstance(c, dict) and c.get("type") == "text"
+                )
+            content = str(content)[:300]  # 截断
+            if content.strip():
+                lines.append(f"[{role}]: {content.strip()}")
+
+        return lines, recent
 
     async def summarize(self, messages: list, existing_summary: str = "") -> str:
         """将消息列表压缩为结构化摘要。
@@ -66,28 +134,14 @@ class ConversationSummarizer:
         if not messages:
             return existing_summary or ""
 
-        # 早期消息 → 压缩为摘要；最近消息 → 完整保留
-        early = messages[:-self.keep_recent] if len(messages) > self.keep_recent else []
-        if not early:
+        lines, _ = self._collect_early(messages)
+        if not lines:
             return existing_summary or ""
-
-        # 格式化早期消息为文本
-        lines = []
-        for m in early:
-            role = getattr(m, "type", "unknown")
-            content = getattr(m, "content", "")
-            if isinstance(content, list):
-                content = " ".join(str(c) for c in content)
-            content = str(content)[:300]  # 截断
-            if content.strip():
-                lines.append(f"[{role}]: {content.strip()}")
 
         conversation_text = "\n".join(lines)
 
-        context_prefix = ""
         if existing_summary:
-            context_prefix = f"## 已有摘要\n{existing_summary}\n\n## 新增对话\n{conversation_text}"
-            prompt_text = context_prefix
+            prompt_text = f"## 已有摘要\n{existing_summary}\n\n## 新增对话\n{conversation_text}"
         else:
             prompt_text = conversation_text
 
@@ -107,7 +161,7 @@ class ConversationSummarizer:
             )
             summary = (resp.choices[0].message.content or "").strip()
             if summary:
-                logger.info("对话摘要已生成: %d chars (from %d messages)", len(summary), len(early))
+                logger.info("对话摘要已生成: %d chars (from %d messages)", len(summary), len(lines))
                 return summary
         except Exception:
             logger.warning("摘要生成失败", exc_info=True)
@@ -119,7 +173,10 @@ class ConversationSummarizer:
         messages: list,
         summary: str,
     ) -> list:
-        """构建压缩后的消息列表：摘要 + 最近消息。
+        """构建压缩后的消息列表：摘要 + 最近消息（按 token 预算保留）。
+
+        与旧实现兼容：保留最近消息的条数默认用 ``keep_recent``；
+        仅当 ``keep_tokens > 0`` 时按 token 预算截断（Codex 风格滑动窗口）。
 
         Args:
             messages: 原始消息列表。
@@ -131,12 +188,17 @@ class ConversationSummarizer:
         from langchain_core.messages import SystemMessage
 
         recent = messages[-self.keep_recent:] if len(messages) > self.keep_recent else messages
-        compact = []
+
+        # token 预算截断（保留最近，丢弃最老）
+        if self.keep_tokens > 0:
+            recent, _dropped = truncate_messages_to_budget(recent, self.keep_tokens)
+
+        compact: list = []
 
         # 摘要作为 system message 注入
         if summary:
             compact.append(SystemMessage(
-                content=f"## 历史对话摘要\n{summary}\n\n请结合以上摘要理解用户的后续问题。"
+                content=f"{SUMMARY_PREFIX}\n{summary}\n\n请结合以上摘要理解用户的后续问题。"
             ))
 
         compact.extend(recent)
@@ -155,3 +217,11 @@ def get_summarizer() -> ConversationSummarizer:
     if _summarizer is None:
         _summarizer = ConversationSummarizer()
     return _summarizer
+
+
+def estimate_growth_tokens(messages: list, summary: str = "") -> int:
+    """估算「新增对话」（不含已有摘要与噪声）的 token 数。
+
+    供 ``should_summarize`` 的 token 触发条件使用；summary 用于跳过已摘要消息。
+    """
+    return messages_tokens(messages, skip_summary=True, skip_noise=True)

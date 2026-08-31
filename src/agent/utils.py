@@ -3,17 +3,53 @@
 from langchain_core.messages import HumanMessage
 
 
+def content_to_text(content) -> str:
+    """把消息 content（str 或 LangChain 多模态 list）转成纯文本。
+
+    多模态 content 是 list[dict]，含 ``{"type":"text","text":...}`` 与
+    ``{"type":"image_url","image_url":...}`` 等块；只拼接 text 块、丢弃图片块
+    （图片块对意图分类 / 语义缓存键 / 查询改写等纯文本逻辑无意义，且 ``str()``
+    会产生带 base64 的 Python repr）。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "") or ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        return " ".join(p for p in parts if p)
+    return str(content)
+
+
 def extract_user_text(messages: list) -> str:
     """从消息列表中提取最近一条用户消息文本（已清理 lone surrogates）。
 
-    遍历消息列表（反向），返回第一条 HumanMessage 的内容。
-    如果找不到用户消息则返回空字符串。
+    遍历消息列表（反向），返回第一条 HumanMessage 的内容（多模态消息
+    只取文本块，见 content_to_text）。如果找不到用户消息则返回空字符串。
     """
     for m in reversed(messages):
         if isinstance(m, HumanMessage) and m.content:
-            raw = str(m.content)
+            raw = content_to_text(m.content)
             return raw.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
     return ""
+
+
+def messages_have_image(messages: list) -> bool:
+    """检查消息列表中是否存在图片块（多模态输入）。
+
+    语义缓存以 user_text 为键，图片问答若只按文本缓存会跨图串味；调用方
+    检测到图片时应跳过缓存读写。
+    """
+    for m in messages:
+        content = getattr(m, "content", None)
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "image_url":
+                    return True
+    return False
 
 
 def is_tool_error(msg) -> bool:

@@ -13,7 +13,9 @@ ApprovalMode = Literal["strict", "standard", "off"]
 # (工具名前缀, 风险等级, 审批原因描述)
 HIGH_RISK_TOOLS: list[tuple[str, RiskLevel, str]] = [
     ("execute_code", "high", "执行代码（可能修改文件系统或运行任意命令）"),
+    ("mcp_rpa_", "high", "浏览器自动化操作（可能影响生产环境店铺数据）"),
     ("rpa_", "high", "浏览器自动化操作（可能影响生产环境店铺数据）"),
+    ("submit_rpa_", "high", "提交 RPA 批量任务（执行后可能影响生产环境店铺数据）"),
     ("amazon_", "high", "Amazon 店铺操作（可能影响实际业务）"),
     ("mcp_write_file", "medium", "写入文件"),
     ("mcp_edit_file", "medium", "编辑文件内容"),
@@ -23,6 +25,7 @@ HIGH_RISK_TOOLS: list[tuple[str, RiskLevel, str]] = [
     ("tool_forget_memory", "medium", "删除用户记忆数据"),
     ("tool_index_knowledge", "medium", "将内容写入知识库"),
     ("mcp_docker_", "high", "Docker 容器管理（可能影响运行中的服务）"),
+    ("tool_shimaotong_", "high", "世贸通抬头报关（可能真实创建/提交业务订单）"),
 ]
 
 # risk_level → emoji 展示映射
@@ -165,3 +168,34 @@ def get_approval_mode() -> ApprovalMode:
     if mode in ("off", "strict", "standard"):
         return mode  # type: ignore[return-value]
     return "standard"
+
+
+def check_command_policy(tool_args: dict | None) -> tuple[bool, str]:
+    """对工具参数中的 shell/代码命令做命令级策略检查（prefix_rule 引擎）。
+
+    作为工具名粒度审批之外的第二道闸：即使 ``execute_code`` 已是 high 风险，
+    这里也能把「包含明确破坏性命令」的调用单点升级为 forbidden。
+
+    从 args 中识别命令文本（code / command / cmd / script 字段），
+    命中 forbidden 规则时返回 (True, 原因)；否则返回 (False, "")。
+
+    Returns:
+        (is_forbidden, reason)
+    """
+    if not isinstance(tool_args, dict):
+        return False, ""
+
+    from .exec_policy import Decision, check_command
+
+    for key in ("code", "command", "cmd", "script", "text"):
+        raw = tool_args.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        # 多行代码/脚本逐行检查，任一行 forbidden 即整体 forbidden
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if check_command(line) >= Decision.FORBIDDEN:
+                return True, f"命令被安全策略禁止：`{line[:120]}`"
+    return False, ""

@@ -12,6 +12,7 @@ export type WSEventType =
   | 'model'
   | 'tool_call'
   | 'tool_result'
+  | 'rpa_log'
   | 'plan'
   | 'system'
   | 'error'
@@ -25,7 +26,8 @@ export interface WSThreadId { type: 'thread_id'; content: string }
 export interface WSText { type: 'text'; content: string; model?: string }
 export interface WSModel { type: 'model'; model: string }
 export interface WSToolCall { type: 'tool_call'; tool: string; args: string }
-export interface WSToolResult { type: 'tool_result'; tool: string; content: string; error: boolean; denied?: boolean }
+export interface WSToolResult { type: 'tool_result'; tool: string; content: string; error: boolean; denied?: boolean; truncated?: boolean }
+export interface WSRpaLog { type: 'rpa_log'; content: string; level?: string; time?: string }
 export interface WSPlan { type: 'plan'; content: string }
 export interface WSSystem { type: 'system'; content: string }
 export interface WSError { type: 'error'; content: string }
@@ -74,6 +76,13 @@ export interface TaskPlanResponse {
 
 // ── UI 消息模型 ──
 
+/** RPA 执行日志中的一行（后端推送 {"type":"rpa_log"}）。 */
+export interface RpaLogLine {
+  content: string
+  level?: string
+  time?: string
+}
+
 /** 附着在 AI 消息卡片上的工具标签（搜索/代码/RPA + 运行状态）。 */
 export interface UIToolChip {
   name: string
@@ -81,7 +90,9 @@ export interface UIToolChip {
   tag: ToolTag | null
   status: 'running' | 'done' | 'error' | 'denied'
   result?: string
+  truncated?: boolean
   expanded?: boolean
+  logs?: RpaLogLine[]   // 执行期间的实时日志（仅 RPA 工具）
 }
 
 export interface UIMessage {
@@ -92,6 +103,7 @@ export interface UIMessage {
   renderedHtml?: string  // 缓存的 markdown 渲染结果（流式期间节流更新，避免 O(n²) 重解析）
   plan?: string          // planner 输出的执行计划
   tools?: UIToolChip[]   // 工具调用标签与结果
+  images?: string[]      // 用户消息附带的图片（base64 data URI），多模态输入展示用
 }
 
 // ── 审批相关 ──
@@ -108,6 +120,7 @@ export type WSEvent =
   | WSModel
   | WSToolCall
   | WSToolResult
+  | WSRpaLog
   | WSPlan
   | WSSystem
   | WSError
@@ -145,6 +158,8 @@ export function parseWSEvent(raw: unknown): WSEvent | WSAuthOk | null {
       return typeof d.tool === 'string' && typeof d.content === 'string'
         ? (d as unknown as WSToolResult)
         : null
+    case 'rpa_log':
+      return typeof d.content === 'string' ? (d as unknown as WSRpaLog) : null
     case 'done':
       return { type: 'done' }
     case 'approval_required':

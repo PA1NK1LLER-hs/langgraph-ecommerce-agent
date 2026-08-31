@@ -11,6 +11,7 @@ from config import LLM_API_KEY, LLM_BASE_URL
 
 
 _shared_client: AsyncOpenAI | None = None
+_vision_client: AsyncOpenAI | None = None
 
 
 def _build_client_kwargs(api_key: str | None = None, base_url: str | None = None) -> dict:
@@ -50,7 +51,21 @@ def get_async_openai_client(
     return AsyncOpenAI(**_build_client_kwargs(api_key, base_url))
 
 
+def get_vision_client() -> AsyncOpenAI:
+    """获取视觉模型专用客户端（与文本 LLM 分离，避免连接池与模型名混用）。
+
+    默认复用主 LLM 的 key/base_url（config 里 VISION_* 回退到 LLM_*），
+    需要独立视觉网关时在 .env 单独设 VISION_API_KEY / VISION_BASE_URL。
+    """
+    global _vision_client
+    if _vision_client is None:
+        from config import VISION_API_KEY, VISION_BASE_URL
+        _vision_client = AsyncOpenAI(**_build_client_kwargs(VISION_API_KEY, VISION_BASE_URL))
+    return _vision_client
+
+
 def reset_async_client() -> None:
     """配置变更后重建共享客户端（如密钥轮换）。"""
-    global _shared_client
+    global _shared_client, _vision_client
     _shared_client = None
+    _vision_client = None

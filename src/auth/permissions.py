@@ -63,6 +63,8 @@ def role_at_least(user_role: str, required: str) -> bool:
 HIGH_RISK_TOOLS: set[str] = {
     "execute_code",
     "rpa_",
+    "mcp_rpa_",
+    "submit_rpa_",
     "mcp_playwright",
     "mcp_docker",
     "mcp_write_file",

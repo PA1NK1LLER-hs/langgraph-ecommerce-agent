@@ -503,7 +503,11 @@ class DocumentParser:
     def _parse_image(path: Path, metadata: dict) -> ParsedDocument:
         """解析图片 — 转为 base64 供 Vision LLM 处理。
 
-        实际 OCR/描述由 Vision LLM 完成，这里只做 base64 编码。
+        实际 OCR/描述由 Vision LLM 完成（见 agent.vision.describe_image）。
+        这里只做 base64 编码并存到 metadata.image_base64；text 放占位符
+        ``[IMAGE: name]``，避免把 base64 大 blob 塞进分块文本被向量化/索引
+        （base64 对检索毫无意义，还会撑爆 chunk）。入库前由
+        agent.vision.enrich_image_chunks 用视觉描述替换占位符。
         """
         import base64
         mime_type, _ = mimetypes.guess_type(str(path))
@@ -514,7 +518,7 @@ class DocumentParser:
             data = base64.b64encode(f.read()).decode("ascii")
 
         data_uri = f"data:{mime_type};base64,{data}"
-        text = f"[IMAGE: {path.name}]\n![{path.name}]({data_uri})"
+        text = f"[IMAGE: {path.name}]"
         return ParsedDocument(text=text, metadata={**metadata, "image_base64": data_uri, "mime_type": mime_type})
 
     @staticmethod

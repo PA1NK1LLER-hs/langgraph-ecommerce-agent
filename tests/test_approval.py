@@ -9,6 +9,7 @@ from agent.approval import (
     build_approval_message,
     build_approval_payload,
     get_approval_mode,
+    check_command_policy,
     HIGH_RISK_TOOLS,
 )
 
@@ -86,6 +87,13 @@ class TestClassifyToolRisk:
     def test_amazon_prefix_match(self):
         needs, _, _ = classify_tool_risk("amazon_list_products")
         assert needs is True
+
+    def test_submit_rpa_is_high_risk(self):
+        """submit_rpa_* 提交任务 = 高风险（拦提交，可能影响生产店铺数据）。"""
+        needs, level, reason = classify_tool_risk("submit_rpa_update_track_table")
+        assert needs is True
+        assert level == "high"
+        assert reason
 
     # ── 审批模式 ──
 
@@ -216,6 +224,37 @@ class TestGetApprovalMode:
     def test_case_insensitive(self, monkeypatch):
         monkeypatch.setenv("APPROVAL_MODE", "OFF")
         assert get_approval_mode() == "off"
+
+
+# ═══════════════════════════════════════════════════
+# check_command_policy（命令级策略，借鉴 Codex execpolicy）
+# ═══════════════════════════════════════════════════
+
+class TestCheckCommandPolicy:
+    def test_forbidden_command(self):
+        is_forbidden, reason = check_command_policy({"code": "rm -rf /tmp"})
+        assert is_forbidden is True
+        assert "禁止" in reason
+
+    def test_allowed_command(self):
+        is_forbidden, _ = check_command_policy({"code": "ls -la"})
+        assert is_forbidden is False
+
+    def test_multiline_any_forbidden(self):
+        code = "ls -la\nrm -rf /\n"
+        is_forbidden, _ = check_command_policy({"code": code})
+        assert is_forbidden is True
+
+    def test_script_key(self):
+        is_forbidden, _ = check_command_policy({"script": "sudo reboot"})
+        assert is_forbidden is True
+
+    def test_non_dict_args(self):
+        assert check_command_policy(None) == (False, "")
+        assert check_command_policy("not a dict") == (False, "")
+
+    def test_no_command_field(self):
+        assert check_command_policy({"foo": "bar"}) == (False, "")
 
 
 # ═══════════════════════════════════════════════════

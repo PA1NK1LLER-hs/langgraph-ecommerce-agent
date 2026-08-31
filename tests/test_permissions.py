@@ -65,6 +65,9 @@ class TestToolPermissions:
         allowed, _ = can_use_tool("rpa_browser_click", "editor")
         assert allowed
 
+        allowed, _ = can_use_tool("submit_rpa_update_track_table", "editor")
+        assert allowed
+
     def test_editor_can_write_kb(self):
         from auth.permissions import can_use_tool
         allowed, _ = can_use_tool("tool_index_knowledge", "editor")
@@ -78,7 +81,8 @@ class TestToolPermissions:
     def test_viewer_cannot_use_high_risk_tools(self):
         from auth.permissions import can_use_tool
         for tool in ["execute_code", "mcp_write_file", "mcp_docker", "mcp_playwright",
-                      "rpa_browser_navigate", "mcp_edit_file", "mcp_delete_files"]:
+                      "rpa_browser_navigate", "mcp_edit_file", "mcp_delete_files",
+                      "submit_rpa_update_track_table"]:
             allowed, reason = can_use_tool(tool, "viewer")
             assert not allowed, f"Viewer should NOT be able to use {tool}"
             assert "观察者" in reason

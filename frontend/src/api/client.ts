@@ -36,6 +36,9 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     const detail = Array.isArray(err.detail) ? '请求参数有误' : err.detail
     throw new Error(detail || `HTTP ${res.status}`)
   }
+  // 204 No Content 无响应体：直接返回 undefined，避免 res.json() 抛 SyntaxError
+  // （此前删除对话请求后端返回 204，前端因该异常吞掉错误，列表不刷新）
+  if (res.status === 204) return undefined as T
   return res.json()
 }
 
@@ -118,3 +121,25 @@ export const reindexSource = (source: string, file: File) => {
     body: formData,
   }).then(r => { if (!r.ok) return r.json().then(e => { throw new Error(e.detail || `HTTP ${r.status}`) }); return r.json() })
 }
+
+// RPA 任务队列
+export type RpaJobStatus = 'queued' | 'running' | 'done' | 'failed'
+export interface RpaJob {
+  job_id: string
+  job_type: string
+  params: string
+  status: RpaJobStatus
+  error: string | null
+  result: string | null
+  created_at: string | null
+  started_at: string | null
+  finished_at: string | null
+}
+export const listRpaJobs = (params?: { limit?: number; status?: string }) => {
+  const q = new URLSearchParams()
+  if (params?.limit) q.set('limit', String(params.limit))
+  if (params?.status) q.set('status', params.status)
+  const s = q.toString()
+  return request<{ jobs: RpaJob[]; count: number }>('GET', `/api/rpa/jobs${s ? `?${s}` : ''}`)
+}
+export const getRpaJob = (jobId: string) => request<RpaJob>('GET', `/api/rpa/jobs/${encodeURIComponent(jobId)}`)

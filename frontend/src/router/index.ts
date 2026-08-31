@@ -42,6 +42,11 @@ const router = createRouter({
           name: 'memories',
           component: () => import('../views/MemoriesView.vue'),
         },
+        {
+          path: 'rpa',
+          name: 'rpa',
+          component: () => import('../views/RPAJobsView.vue'),
+        },
       ],
     },
     { path: '/:pathMatch(.*)*', redirect: '/chat' },

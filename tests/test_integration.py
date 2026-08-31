@@ -151,6 +151,15 @@ class TestMCPFilesystem:
         print(f"  [MCP Tools] MCP tool names: {sorted(mcp_tools)[:20]}")
         assert len(mcp_tools) > 0, "No MCP tools registered!"
 
+        # 关闭 MCP stdio 子进程：本测试的 event loop 马上要关（function 级 loop 作用域），
+        # 若 npx 子进程的后台 reader task 仍存活，Windows Proactor 的 `_cancel_all_tasks`
+        # 会卡死（测试断言过了却挂在收尾）。与 test_mcp_list_directory 末尾同款清理。
+        try:
+            from agent.mcp_setup import shutdown_mcp_tools
+            await shutdown_mcp_tools()
+        except Exception:
+            pass
+
     @pytest.mark.asyncio
     async def test_mcp_list_directory(self):
         """通过 MCP 列出项目根目录。"""
@@ -176,6 +185,14 @@ class TestMCPFilesystem:
         if result.get("status") == "success":
             files = result.get("results", [])
             print(f"  [MCP ListDir] found {len(files)} entries")
+
+        # 关闭 MCP stdio 子进程：其后台 reader task 若在会话 loop 关闭时仍存活，
+        # 会在 Windows Proactor 上卡死 `_cancel_all_tasks`（集成测试正常跑完却卡在收尾）。
+        try:
+            from agent.mcp_setup import shutdown_mcp_tools
+            await shutdown_mcp_tools()
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════

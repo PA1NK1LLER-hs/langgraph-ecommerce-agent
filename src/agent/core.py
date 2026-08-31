@@ -8,6 +8,8 @@ from langchain_core.tools import tool
 from config import LLM_API_KEY, LLM_BASE_URL
 from rag import async_search_knowledge, async_index_knowledge, async_list_sources
 from skills import get_skill_tools
+from .context_budget import DEFAULT_CONTEXT_WINDOW_TOKENS
+from .rpa_jobs import get_submit_rpa_tools
 
 
 
@@ -324,6 +326,74 @@ async def tool_list_knowledge_sources() -> dict:
     return await async_list_sources()
 
 
+@tool
+async def tool_describe_image(image: str, question: str = "") -> dict:
+    """调用视觉模型理解图片内容（OCR 文字转录 + 画面描述）。
+
+    当用户上传图片、或需要识别图片中的文字、商品、截图、表格、票据等内容时使用。
+    image 支持 base64 data URI、http(s) URL 或本地文件路径。
+
+    Args:
+        image:    图片（base64 data URI / http(s) URL / 本地文件路径）。
+        question: 针对图片的具体问题，留空则做完整描述 + OCR 转录。
+    """
+    from .vision import describe_image, DEFAULT_DESCRIBE_PROMPT
+    prompt = DEFAULT_DESCRIBE_PROMPT
+    if question:
+        prompt = f"{question}\n（请同时完整转录图中所有文字）"
+    desc = await describe_image(image, prompt=prompt)
+    if not desc:
+        return {"status": "error", "message": "图片理解失败或视觉模型未启用"}
+    return {"status": "success", "description": desc}
+
+
+# ---------------------------------------------------------------------------
+# 上下文预算感知（借鉴 Codex get_context_remaining 元认知工具）
+# ---------------------------------------------------------------------------
+
+# 当前会话已消耗的 prompt token 数（由 graph 在每轮 call_model 前更新）。
+# 工具在独立调用上下文中执行，无法直接读取 state，因此通过模块级变量透传
+# 一个「尽力而为」的预算信号；读不到时工具返回 tokens_left=null。
+_session_prompt_tokens: int | None = None
+_context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
+
+
+def set_session_prompt_tokens(tokens: int | None) -> None:
+    """更新当前会话已消耗的 prompt token 数（graph 每轮调用前设置）。"""
+    global _session_prompt_tokens
+    _session_prompt_tokens = tokens
+
+
+def set_context_window_tokens(tokens: int) -> None:
+    """覆盖上下文窗口大小（默认 128k，可按模型实际上下文调整）。"""
+    global _context_window_tokens
+    _context_window_tokens = int(tokens)
+
+
+def get_context_remaining_tokens() -> int | None:
+    """返回剩余可用 token 数，无法估算时返回 None。"""
+    if _session_prompt_tokens is None:
+        return None
+    return max(0, _context_window_tokens - _session_prompt_tokens)
+
+
+@tool
+async def tool_get_context_remaining() -> dict:
+    """查询当前上下文窗口还剩多少 token 预算。
+
+    当对话很长、或即将继续追加大量内容前调用，用于判断是否需要收敛回答、
+    主动压缩上下文或提醒用户开启新会话。剩余预算不足时优先精简回答而非继续调用工具。
+
+    Returns:
+        {"tokens_left": int | null, "context_window": int, "used_tokens": int | null}
+    """
+    return {
+        "tokens_left": get_context_remaining_tokens(),
+        "context_window": _context_window_tokens,
+        "used_tokens": _session_prompt_tokens,
+    }
+
+
 # ---------------------------------------------------------------------------
 # System Prompt（动态生成 — 基于实际注册的工具列表）
 # ---------------------------------------------------------------------------
@@ -334,6 +404,7 @@ _TOOL_CAPABILITY_MAP: list[tuple[str, str, str]] = [
     # (前缀, 类别名, 能力描述)
     ("tool_search_knowledge", "知识库检索", "语义检索已索引的文档/参考资料"),
     ("tool_list_knowledge_sources", "知识库概况", "列出知识库所有已索引的文档来源"),
+    ("tool_describe_image", "图片理解", "视觉模型 OCR/描述图片内容"),
     ("tool_index_knowledge", "知识库入库", "将文本/文档分块后存入知识图谱"),
     ("tool_add_memory", "用户记忆", "保存用户偏好/习惯/背景"),
     ("tool_search_memory", "用户记忆", "语义搜索已存储的用户记忆"),
@@ -341,6 +412,7 @@ _TOOL_CAPABILITY_MAP: list[tuple[str, str, str]] = [
     ("tool_list_memories", "用户记忆", "列出所有用户记忆"),
     ("tool_save_episodic_memory", "用户记忆", "保存关键事件/决策的情景记忆"),
     ("tool_get_conversation_context", "用户记忆", "获取完整对话上下文（情景+语义记忆）"),
+    ("tool_get_context_remaining", "上下文预算", "查询上下文窗口剩余 token 预算"),
     ("mcp_searxng", "联网搜索", "SearXNG 聚合搜索引擎（Google/DDG/Startpage）"),
     ("mcp_web_url_read", "联网搜索", "读取网页详细内容"),
     ("mcp_filesystem", "文件系统", "读写/搜索/编辑本地文件"),
@@ -349,11 +421,13 @@ _TOOL_CAPABILITY_MAP: list[tuple[str, str, str]] = [
     ("mcp_edit_file", "文件系统", "编辑文件"),
     ("mcp_list_directory", "文件系统", "列出目录内容"),
     ("mcp_playwright", "RPA 浏览器", "浏览器自动化操作"),
+    ("mcp_rpa_", "RPA 浏览器", "紫鸟浏览器自动化操作（独立 MCP server 提供）"),
     ("mcp_get_current_time", "时间查询", "获取当前日期和时间"),
     ("mcp_sequentialthinking", "多步推理", "结构化多步骤推理分析"),
     ("mcp_docker", "容器管理", "Docker 容器/镜像管理"),
     ("execute_code", "代码执行", "安全执行 Python/Shell 代码"),
     ("rpa_", "RPA 浏览器", "紫鸟浏览器自动化操作"),
+    ("submit_rpa_", "RPA 浏览器", "提交 RPA 批量任务（排队执行，立即返回 job_id）"),
 ]
 
 
@@ -384,7 +458,7 @@ def _build_capability_context() -> tuple[str, str]:
         "知识库检索", "知识库概况", "知识库入库",
         "用户记忆", "联网搜索", "文件系统",
         "RPA 浏览器", "代码执行", "多步推理",
-        "时间查询", "容器管理",
+        "时间查询", "容器管理", "图片理解",
     ]
     cat_idx = 1
     for cat in cat_order:
@@ -468,7 +542,8 @@ def get_system_prompt(prompt_version: str | None = None) -> str:
         "- 代码块使用三个反引号包裹并标注语言（例如 ```python）。\n"
         "- 保持回复简洁、准确、有帮助。\n"
         "- 工具返回错误时，分析原因并告诉用户。\n"
-        "- **对话结束时用户信息必须已保存到记忆中。**\n\n"
+        "- **对话结束时用户信息必须已保存到记忆中。**\n"
+        "- **世贸通抬头报关**：若工具返回\"未找到报关文件/未找到待办报关 Excel/未找到任何子订单\"，立即停止并如实告知用户当前没有待办报关文件，**不得**再调用其他工具（文件系统、知识库、联网搜索等）去查找报关文件。\n\n"
         "## 来源引用规则（使用知识库时必须遵守）\n"
         "- 当回答使用了知识库检索的内容时，**必须在回答末尾列出引用来源**。\n"
         "- 引用格式：[N] 来源: {文件名}（相关度: {score}）\n"
@@ -506,7 +581,11 @@ def register_mcp_tools(tools: list) -> None:
 
 
 def get_core_tools() -> list:
-    """返回核心工具列表（不含 skill 工具）。"""
+    """返回核心工具列表（不含 skill 工具）。
+
+    含 3 个 RPA 提交工具（submit_rpa_*）：LLM 只产出「哪种任务 + 参数」，
+    提交即返回 job_id，由后台调度器排队执行，绝不阻塞回合。
+    """
     return [
         tool_search_knowledge,
         tool_index_knowledge,
@@ -517,6 +596,9 @@ def get_core_tools() -> list:
         tool_save_episodic_memory,
         tool_get_conversation_context,
         tool_list_knowledge_sources,
+        tool_describe_image,
+        tool_get_context_remaining,
+        *get_submit_rpa_tools(),
     ]
 
 

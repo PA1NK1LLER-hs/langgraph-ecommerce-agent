@@ -18,6 +18,7 @@ from ..database import get_db
 from ..deps import get_current_user
 from ..models import User as UserModel, Thread as ThreadModel
 from config import display_model_name
+from agent.utils import content_to_text
 
 logger = logging.getLogger("api.threads")
 router = APIRouter(prefix="/api/threads", tags=["threads"])
@@ -289,7 +290,8 @@ async def _load_messages_from_checkpoint(thread_id: str) -> list[dict]:
 
             if msg_type == "human":
                 content = getattr(m, "content", "") if hasattr(m, "content") else m.get("content", "")
-                safe.append({"role": "user", "content": str(content)})
+                # 多模态消息（list）只取文本块，避免 base64 图片块泄入历史（见 content_to_text）
+                safe.append({"role": "user", "content": content_to_text(content)})
             elif msg_type == "ai":
                 content = getattr(m, "content", "") if hasattr(m, "content") else m.get("content", "")
                 has_tool_calls = bool(getattr(m, "tool_calls", None) if hasattr(m, "tool_calls") else False)

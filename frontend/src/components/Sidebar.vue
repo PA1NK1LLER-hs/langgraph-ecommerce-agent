@@ -23,6 +23,7 @@ const navItems = [
   { to: '/kb', label: '知识库管理', icon: 'database' },
   { to: '/knowledge', label: '知识库', icon: 'search' },
   { to: '/memories', label: '记忆', icon: 'memory' },
+  { to: '/rpa', label: 'RPA 任务', icon: 'rpa' },
 ]
 
 async function newThread() {

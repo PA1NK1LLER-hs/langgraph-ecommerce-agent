@@ -188,3 +188,84 @@ def match_specialist_tools(specialist: Specialist, all_tools_map: dict) -> list:
 def get_specialist(specialist_name: str) -> Specialist | None:
     """根据名称获取 Specialist 配置。"""
     return SPECIALISTS.get(specialist_name)
+
+
+# ---------------------------------------------------------------------------
+# 多 Agent 消息协议 + mailbox（借鉴 Codex multi-agent 消息语义）
+# ---------------------------------------------------------------------------
+#
+# Codex 的多 Agent 通过统一的消息协议（NEW_TASK / MESSAGE / FINAL_ANSWER）
+# 在 supervisor 与 specialist 之间传递任务与结果。这里提供同构的轻量实现：
+# - 消息统一为 (kind, task, sender, payload) 四元组，可安全序列化进
+#   ``specialist_history`` / ``specialist_task`` 等 state 字段。
+# - Mailbox 提供按任务汇聚消息的队列语义，supervisor 派发后从 mailbox 收结果。
+# 与现有 supervisor 路由（SUPERVISOR_PROMPT + match_specialist_tools）正交，
+# 仅统一「消息格式」这一层，不改动既有路由逻辑。
+
+from dataclasses import dataclass, field as _field
+
+# 消息类型常量
+NEW_TASK = "new_task"
+MESSAGE = "message"
+FINAL_ANSWER = "final_answer"
+
+# 合法消息类型集合
+_MESSAGE_KINDS = {NEW_TASK, MESSAGE, FINAL_ANSWER}
+
+
+@dataclass
+class AgentMessage:
+    """inter-agent 消息。"""
+    kind: str                      # new_task | message | final_answer
+    task: str                      # 任务名（关联一次委派）
+    sender: str = ""               # 发送方 specialist 名
+    payload: str = ""              # 消息内容 / 任务描述 / 最终答案
+
+    def __post_init__(self) -> None:
+        if self.kind not in _MESSAGE_KINDS:
+            raise ValueError(f"未知消息类型: {self.kind!r}（应为 {sorted(_MESSAGE_KINDS)} 之一）")
+
+    def to_dict(self) -> dict:
+        return {"kind": self.kind, "task": self.task, "sender": self.sender, "payload": self.payload}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AgentMessage":
+        return cls(
+            kind=data.get("kind", ""),
+            task=data.get("task", ""),
+            sender=data.get("sender", ""),
+            payload=data.get("payload", ""),
+        )
+
+
+def encode_message(kind: str, task: str, sender: str = "", payload: str = "") -> dict:
+    """把消息编码为可序列化字典（state 字段可安全存储）。"""
+    return AgentMessage(kind=kind, task=task, sender=sender, payload=payload).to_dict()
+
+
+def decode_message(data: dict) -> AgentMessage:
+    """把字典解码为 AgentMessage（含类型校验）。"""
+    return AgentMessage.from_dict(data)
+
+
+@dataclass
+class Mailbox:
+    """按任务汇聚消息的 mailbox。
+
+    supervisor 派发任务（NEW_TASK）后，specialist 的消息（MESSAGE /
+    FINAL_ANSWER）按 ``task`` 分组入队；``collect(task)`` 取回该任务的全部消息。
+    """
+    messages: dict[str, list[AgentMessage]] = _field(default_factory=dict)
+
+    def send(self, msg: AgentMessage) -> None:
+        self.messages.setdefault(msg.task, []).append(msg)
+
+    def collect(self, task: str) -> list[AgentMessage]:
+        return list(self.messages.get(task, []))
+
+    def final_answers(self, task: str) -> list[AgentMessage]:
+        """取回某任务的最终答案（FINAl_ANSWER）。"""
+        return [m for m in self.collect(task) if m.kind == FINAL_ANSWER]
+
+    def all_tasks(self) -> list[str]:
+        return list(self.messages.keys())

@@ -345,14 +345,16 @@ class TestIndexerBugFixes:
     def test_tags_passed_to_lightrag(self):
         """B2 修复：tags/user_id 参数不再通过不支持的 addon_params 传递，
         而是仅记录日志（LightRAG 1.5.x 不支持自定义元数据参数）。"""
-        from unittest.mock import AsyncMock, patch, MagicMock
+        from unittest.mock import AsyncMock, patch
 
-        # Mock: ensure_initialized_async is a no-op, _rag exists with ainsert
+        # Mock: ensure_initialized_async is a no-op，且 _rag 暴露当前真实调用的
+        # apipeline_enqueue_documents / apipeline_process_enqueue_documents 管道方法。
         with patch("rag.indexer.KnowledgeIndexer._ensure_initialized_async", AsyncMock()):
             from rag.indexer import KnowledgeIndexer
             indexer = KnowledgeIndexer()
             mock_rag = MagicMock()
-            mock_rag.ainsert = AsyncMock()
+            mock_rag.apipeline_enqueue_documents = AsyncMock()
+            mock_rag.apipeline_process_enqueue_documents = AsyncMock()
             indexer._rag = mock_rag
 
             import asyncio
@@ -360,11 +362,15 @@ class TestIndexerBugFixes:
                 await indexer._index_async("test text", "src1", tags="tag1,tag2", user_id="u1")
             asyncio.run(_run())
 
-            # Verify ainsert was called without addon_params (LightRAG 1.5.x compatibility)
-            call_kwargs = mock_rag.ainsert.call_args
+            # Verify the enqueue pipeline was called (not the old ainsert API)
+            mock_rag.apipeline_enqueue_documents.assert_awaited_once()
+            mock_rag.apipeline_process_enqueue_documents.assert_awaited_once()
+            call_kwargs = mock_rag.apipeline_enqueue_documents.call_args
             assert call_kwargs is not None
             _, kwargs = call_kwargs
-            # file_paths should contain only the source, not extra metadata
-            assert kwargs.get("file_paths") == ["src1"]
-            # addon_params should NOT be passed (LightRAG 1.5.x doesn't accept it)
+            # file_paths 是唯一化后的路径（"src1::<uuid>"），不再是裸 source，
+            # 且 addon_params 不应传入（LightRAG 1.5.x 不接受）。
+            fps = kwargs.get("file_paths")
+            assert isinstance(fps, list) and len(fps) == 1
+            assert fps[0].startswith("src1::")
             assert "addon_params" not in kwargs

@@ -6,6 +6,15 @@
 
 使用 BM25（rank_bm25）做关键词匹配，LightRAG 做语义召回，
 Reciprocal Rank Fusion (RRF) 融合排序，DashScope 做精排。
+
+注意：`_BM25Index` 是进程内内存索引，服务重启即丢。因此 BM25 通过「启动时从
+LightRAG text_chunks 重建」（`KnowledgeIndexer.rebuild_bm25_async`，见
+src/rag/indexer.py）+ 运行期增删同步（`_sync_bm25_source_async` 与
+`_delete_source_async` 的 `remove_source`）来保持与持久化分块一致，**而不是**在
+入库链路直接喂原始文本——LightRAG 入库后会二次切分，原始输入 ≠ 最终分块，只有
+text_chunks 才是权威内容。据此 `mode="hybrid"` 的稀疏支路不再恒空。默认
+`mode="dense"` 不受影响（agent 主链路 graph.py 仍硬编码 dense，hybrid 目前仅
+经 /api/knowledge/search 与 tool_search_knowledge 可达）。
 """
 
 from __future__ import annotations
@@ -233,6 +242,30 @@ class HybridRetriever:
         """移除 BM25 索引中指定来源的文档。"""
         return self._bm25.remove_by_source(source)
 
+    def rebuild(
+        self,
+        texts: list[str],
+        sources: list[str] | None = None,
+        chunk_ids: list[str] | None = None,
+    ) -> int:
+        """清空并用给定语料重建 BM25 索引（启动时从 LightRAG text_chunks 同步）。
+
+        与 index_texts 的区别：先 clear() 再批量填充，保证索引与持久化分块完全
+        一致，避免多次增量 add 造成残留/漂移。返回索引文档数。
+        """
+        self._bm25.clear()
+        metas: list[dict[str, Any]] = []
+        for i, text in enumerate(texts):
+            source = sources[i] if sources and i < len(sources) else ""
+            cid = chunk_ids[i] if chunk_ids and i < len(chunk_ids) else str(i)
+            metas.append({"source": source, "chunk_id": cid})
+        self._bm25.add_batch(texts, metas)
+        return len(texts)
+
+    def bm25_count(self) -> int:
+        """BM25 索引当前文档数（供验证/观测）。"""
+        return len(self._bm25)
+
     # ── 检索 ──
 
     async def search(
@@ -289,23 +322,60 @@ class HybridRetriever:
     # ── 内部 ──
 
     async def _dense_search(self, query: str, top_k: int) -> list[SearchResult]:
-        """LightRAG dense + graph 检索。"""
+        """LightRAG dense + graph 检索。
+
+        优先走结构化检索（分块 + 真实来源/分数），回退到合并字符串兜底。
+        修复：此前把 LightRAG 合并字符串整体包成单条结果（score=1.0、chunk_id=0），
+        导致 chunks 恒为 1、`[N]`/`<SEP>`/代码围栏等污染直接进入上下文。
+        """
         from rag.indexer import get_indexer
         try:
+            # 关闭 LightRAG 内部 rerank：hybrid 模式在 RRF 融合后会再走一次外层 reranker，
+            # 保留此处会导致双重精排（LightRAG 内部 + 外层 HybridRetriever），白白多花一轮。
+            structured = await get_indexer()._search_structured_async(query, top_k, use_rerank=False)
+            if structured:
+                return [
+                    SearchResult(
+                        content=self._clean_context(str(item.get("content", ""))),
+                        score=float(item.get("score", 0.5)),
+                        source=str(item.get("source", "lightrag")),
+                        chunk_id=str(item.get("chunk_id", "")),
+                    )
+                    for item in structured
+                ]
+        except Exception:
+            logger.warning("LightRAG structured search failed, falling back", exc_info=True)
+
+        # 兜底：合并字符串（清洗后单条返回）
+        try:
             result = await get_indexer()._search_async(query, top_k)
-            # 解析 LightRAG 返回的合并上下文字符串
-            # LightRAG local 模式返回纯文本，没有分块边界
-            # 这里包装为单一结果
-            if result:
+            cleaned = self._clean_context(result or "")
+            if cleaned and "[no-context]" not in cleaned:
                 return [SearchResult(
-                    content=result,
-                    score=1.0,
+                    content=cleaned,
+                    score=0.5,
                     source="lightrag_dense",
                     chunk_id="0",
                 )]
         except Exception:
             logger.warning("LightRAG dense search failed", exc_info=True)
         return []
+
+    @staticmethod
+    def _clean_context(text: str) -> str:
+        """清洗 LightRAG 合并上下文字符串：去掉 [N] 索引、<SEP> 分隔符、代码围栏、多余空行。"""
+        import re
+        if not text:
+            return ""
+        # 去掉行首的 [数字] 引用标记
+        text = re.sub(r"^\s*\[\d+\]\s*", "", text, flags=re.MULTILINE)
+        # <SEP> 分隔符 → 换行
+        text = text.replace("<SEP>", "\n")
+        # 代码围栏（```python 等）
+        text = re.sub(r"```[a-zA-Z0-9_-]*", "", text)
+        # 折叠多余空行
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
     @staticmethod
     async def _graph_search(query: str, top_k: int) -> list[SearchResult]:

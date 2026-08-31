@@ -2,6 +2,10 @@
 
 所有技能均使用 @tool 装饰器直接定义在各自的模块中。
 get_skill_tools() 收集所有技能工具供 Agent 绑定。
+
+RPA 批量任务（紫鸟浏览器）不在此注册——始终由独立 RPA MCP 进程提供
+（mcp_rpa_*，本机 stdio / 跨机 HTTP URL），agent 进程内不跑 RPA，
+见 agent.mcp_setup 的 setup_rpa_mcp / ensure_mcp_for_intent。
 """
 
 import logging
@@ -22,19 +26,12 @@ def _discover_tools() -> list:
     except ImportError as e:
         logger.warning("Skill code_executor unavailable: %s", e)
 
-    # rpa_ziniao — 紫鸟浏览器 RPA（15 个工具）
+    # shimaotong — 世贸通抬头报关（HTTP API 自动化，独立于浏览器 RPA）
     try:
-        from skills.rpa_ziniao import get_rpa_tools
-        tools.extend(get_rpa_tools())
+        from skills.shimaotong import get_shimaotong_tools
+        tools.extend(get_shimaotong_tools())
     except ImportError as e:
-        logger.warning("Skill rpa_ziniao unavailable: %s", e)
-
-    # rpa_amazon_get_review — Amazon 评论采集
-    try:
-        from skills.rpa_amazon_get_review import amazon_get_review
-        tools.append(amazon_get_review)
-    except ImportError as e:
-        logger.warning("Skill rpa_amazon_get_review unavailable: %s", e)
+        logger.warning("Skill shimaotong unavailable: %s", e)
 
     return tools
 

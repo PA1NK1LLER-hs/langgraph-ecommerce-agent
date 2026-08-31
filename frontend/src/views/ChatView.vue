@@ -52,6 +52,9 @@ const threads = useThreadsStore()
 const messages = ref<UIMessage[]>([])
 const input = ref('')
 const sending = ref(false)
+// ── 图片附件（多模态输入）：dataUri 用于发送，name 用于缩略图展示 ──
+const attachedImages = ref<{ dataUri: string; name: string }[]>([])
+const fileInput = ref<HTMLInputElement | null>(null)
 const connected = ref(false)
 const agentReady = ref(false)
 let ws: WebSocket | null = null
@@ -82,6 +85,13 @@ const statusColor = computed(() =>
 // ── 工具标签样式：单色主题下用黑白灰 + 图标区分类型，仅状态图标保留语义色 ──
 function tagClasses(_tag: ToolTag | null): string {
   return 'bg-black/5 text-ink-2'
+}
+
+// RPA 执行日志行配色：警告/错误用语义色，其余用次级文字色
+function logLineClass(level?: string): string {
+  if (level === 'error') return 'text-danger'
+  if (level === 'warning') return 'text-warn'
+  return 'text-ink-3'
 }
 
 function ensureAssistant(): UIMessage {
@@ -190,9 +200,26 @@ function connect(threadId?: string) {
         if (chip) {
           chip.status = status
           chip.result = d.content
+          chip.truncated = d.truncated
         } else {
-          tools.push({ name: d.tool, tag: tagForTool(d.tool), status, result: d.content })
+          tools.push({ name: d.tool, tag: tagForTool(d.tool), status, result: d.content, truncated: d.truncated })
         }
+        scrollDown()
+        break
+      }
+      case 'rpa_log': {
+        // RPA 执行日志实时附着到当前运行中的工具标签，展开显示，页面跟随滚动
+        const tools = ensureAssistant().tools!
+        let chip = [...tools].reverse().find(c => c.status === 'running')
+        if (!chip) {
+          // 日志先于 tool_call 到达的兜底：挂一个通用 RPA 标签
+          chip = { name: 'RPA 执行', args: '', tag: tagForTool('rpa'), status: 'running', logs: [] }
+          tools.push(chip)
+        }
+        chip.logs = chip.logs || []
+        chip.logs.push({ content: d.content, level: d.level, time: d.time })
+        if (chip.logs.length > 300) chip.logs = chip.logs.slice(-300)  // 防止超长日志撑爆 DOM
+        chip.expanded = true
         scrollDown()
         break
       }
@@ -206,6 +233,11 @@ function connect(threadId?: string) {
         scrollDown()
         break
       case 'error':
+        // 若占位气泡仍为空（尚未收到任何 token/工具），移除，避免残留空白 AI 卡片
+        if (currentAssistant && !currentAssistant.content && !(currentAssistant.tools?.length)) {
+          const idx = messages.value.indexOf(currentAssistant)
+          if (idx >= 0) messages.value.splice(idx, 1)
+        }
         messages.value.push({ id: ++msgId, role: 'system', content: d.content })
         currentAssistant = null
         sending.value = false
@@ -268,26 +300,63 @@ function denyAction() {
   approvalProcessing.value = false
 }
 
-function pushUser(text: string) {
-  messages.value.push({ id: ++msgId, role: 'user', content: text })
+function pushUser(text: string, images?: string[]) {
+  messages.value.push({ id: ++msgId, role: 'user', content: text, images })
   input.value = ''
+  attachedImages.value = []
+  if (fileInput.value) fileInput.value.value = ''
   sending.value = true
   scrollDown()
 }
 
+// ── 图片附件：本地文件 → base64 data URI ──
+function readFileAsDataUri(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result as string)
+    reader.onerror = () => reject(new Error('读取图片失败'))
+    reader.readAsDataURL(file)
+  })
+}
+
+async function onAttachImages(files: FileList | null) {
+  if (!files || !files.length) return
+  for (const file of Array.from(files)) {
+    if (!file.type.startsWith('image/')) continue
+    if (file.size > 10 * 1024 * 1024) {  // 单图 10MB 上限
+      messages.value.push({ id: ++msgId, role: 'system', content: `图片 ${file.name} 超过 10MB，已跳过` })
+      continue
+    }
+    try {
+      const dataUri = await readFileAsDataUri(file)
+      attachedImages.value.push({ dataUri, name: file.name })
+    } catch {
+      messages.value.push({ id: ++msgId, role: 'system', content: `图片 ${file.name} 读取失败` })
+    }
+  }
+}
+
+function removeImage(index: number) {
+  attachedImages.value.splice(index, 1)
+}
+
 function send() {
   const text = input.value.trim()
-  if (!text || sending.value) return
+  const images = attachedImages.value.map(i => i.dataUri)
+  if ((!text && !images.length) || sending.value) return
   if (!ws || ws.readyState !== WebSocket.OPEN || !authed) {
     // 断线状态下发送：乐观显示气泡并排队，连接恢复后自动发出
     pendingSend = text
-    pushUser(text)
+    pushUser(text || '请描述/分析这张图片', images)
     messages.value.push({ id: ++msgId, role: 'system', content: '正在重新连接…' })
     if (!ws || ws.readyState === WebSocket.CLOSED) connect(currentThreadId)
     return
   }
-  pushUser(text)
-  ws.send(JSON.stringify({ message: text }))
+  pushUser(text || '请描述/分析这张图片', images)
+  // 立即创建 AI 占位气泡：发送后马上显示 typing 动画，而非等首个 token 才出现气泡
+  ensureAssistant()
+  scrollDown()
+  ws.send(JSON.stringify({ message: text || '请描述/分析这张图片', images }))
 }
 
 function reconnect() {
@@ -452,6 +521,10 @@ onUnmounted(() => {
           <div v-else-if="m.role === 'user'" class="flex justify-end msg-in">
             <div class="max-w-[75%] px-4 py-2.5 rounded-card text-[14px] leading-relaxed whitespace-pre-wrap
                         bg-ink text-white shadow-soft">
+              <div v-if="m.images?.length" class="flex flex-wrap gap-2 mb-2">
+                <img v-for="(img, i) in m.images" :key="i" :src="img" alt="附件图片"
+                     class="max-w-[180px] max-h-[180px] rounded-ctrl object-cover border border-white/20" />
+              </div>
               {{ m.content }}
             </div>
           </div>
@@ -527,7 +600,18 @@ onUnmounted(() => {
                               break-words leading-relaxed max-h-56 overflow-y-auto">
                     <div v-if="chip.args" class="text-ink-3 mb-1">参数：{{ chip.args }}</div>
                     <div v-if="chip.result">{{ chip.result }}</div>
-                    <div v-if="!chip.args && !chip.result" class="text-ink-3">（无内容）</div>
+                    <div v-if="chip.truncated" class="text-ink-3 mt-1 text-[11px]">（结果已截断，仅显示前 300 字符）</div>
+                    <div v-if="!chip.args && !chip.result && !chip.logs?.length" class="text-ink-3">（无内容）</div>
+                  </div>
+                  <!-- RPA 执行日志：实时追加，等宽字体，不设高度上限（页面随日志滚动） -->
+                  <div v-if="chip.logs?.length"
+                       class="mt-1.5 ml-1 pl-3 border-l-2 border-line">
+                    <div class="mb-1 text-[10px] uppercase tracking-wider text-ink-3 font-medium">执行日志</div>
+                    <div v-for="(l, j) in chip.logs" :key="j"
+                         class="font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words"
+                         :class="logLineClass(l.level)">
+                      <span v-if="l.time" class="text-ink-3">[{{ l.time }}]</span>{{ l.content }}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -553,8 +637,28 @@ onUnmounted(() => {
       </div>
 
       <div class="max-w-[860px] mx-auto">
+        <!-- 图片附件预览 -->
+        <div v-if="attachedImages.length" class="flex flex-wrap gap-2 mb-2 px-1">
+          <div v-for="(img, i) in attachedImages" :key="i" class="relative">
+            <img :src="img.dataUri" :alt="img.name"
+                 class="w-16 h-16 rounded-ctrl object-cover border border-line shadow-soft" />
+            <button @click="removeImage(i)" aria-label="移除图片"
+                    class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-ink text-white text-[12px] leading-none
+                           flex items-center justify-center shadow-soft">
+              ×
+            </button>
+          </div>
+        </div>
+
         <div class="glass-strong rounded-card border border-line shadow-card p-2 flex items-end gap-2
                     transition-all duration-200 focus-within:border-ink/15 focus-within:shadow-float">
+          <input ref="fileInput" type="file" accept="image/*" multiple class="hidden"
+                 @change="onAttachImages(($event.target as HTMLInputElement).files)" />
+          <button @click="fileInput?.click()" aria-label="添加图片" :disabled="sending"
+                  class="w-10 h-10 rounded-full flex items-center justify-center shrink-0 mb-0.5
+                         scale-press transition-all duration-150 text-ink-2 hover:bg-surface disabled:opacity-50">
+            <AppIcon name="image" :size="18" />
+          </button>
           <textarea
             v-model="input"
             @keydown="handleKeydown"
@@ -572,7 +676,7 @@ onUnmounted(() => {
           <button
             @click="send"
             aria-label="发送消息"
-            :disabled="sending || !input.trim() || !connected"
+            :disabled="sending || (!input.trim() && !attachedImages.length) || !connected"
             class="w-10 h-10 rounded-full flex items-center justify-center shrink-0 mb-0.5 mr-0.5
                    scale-press transition-all duration-150
                    bg-accent hover:bg-accent-hover text-white shadow-soft

@@ -29,13 +29,13 @@ print("=" * 60)
 @check("config")
 def test_config():
     from config import (
-        MIMO_API_KEY, MIMO_MODEL, MIMO_FLASH_MODEL,
-        DASHSCOPE_API_KEY,
+        LLM_API_KEY, LLM_MODEL, LLM_FLASH_MODEL,
+        EMBEDDING_API_KEY,
     )
-    assert MIMO_API_KEY, "MIMO_API_KEY not set"
-    assert DASHSCOPE_API_KEY, "DASHSCOPE_API_KEY not set"
-    from config import DASHSCOPE_EMBEDDING_DIM
-    print(f"    Pro: {MIMO_MODEL}, Flash: {MIMO_FLASH_MODEL}, Embedding dim: {DASHSCOPE_EMBEDDING_DIM}")
+    assert LLM_API_KEY, "LLM_API_KEY not set"
+    assert EMBEDDING_API_KEY, "EMBEDDING_API_KEY not set"
+    from config import EMBEDDING_MODEL
+    print(f"    Model: {LLM_MODEL}, Flash: {LLM_FLASH_MODEL}, Embedding: {EMBEDDING_MODEL}")
 
 @check("context module")
 def test_context():
@@ -58,15 +58,20 @@ def test_context():
 def test_skills():
     from skills import get_skill_tools, list_skills
     tools = get_skill_tools()
-    assert len(tools) == 17, f"Expected 17 skill tools, got {len(tools)}"
+    names = [t.name for t in tools]
+    # 新架构：RPA 批量任务始终由独立 RPA MCP 进程提供（mcp_rpa_*），
+    # 技能目录里只保留 execute_code + shimaotong，不再有进程内 rpa_*。
+    assert "execute_code" in names, names
+    assert "tool_shimaotong_submit" in names, names
+    assert not any(n.startswith("rpa_") or n.startswith("amazon_") for n in names), names
 
     skills_list = list_skills()
-    assert len(skills_list) == 17
+    assert len(skills_list) == len(tools)
 
     for t in tools:
         assert t.name, "Tool missing name"
         assert t.description, f"Tool {t.name} missing description"
-    print(f"    {len(tools)} skill tools loaded")
+    print(f"    {len(tools)} skill tools loaded: {sorted(names)}")
 
 @check("agent core (get_core_tools + get_all_tools)")
 def test_agent_core():
@@ -74,11 +79,6 @@ def test_agent_core():
         get_core_tools, get_all_tools,
     )
     core = get_core_tools()
-    assert len(core) == 7, f"Expected 7 core tools, got {len(core)}"
-
-    all_tools = get_all_tools()
-    assert len(all_tools) == 24, f"Expected 24 total tools, got {len(all_tools)}"
-
     core_names = [t.name for t in core]
     expected = [
         "tool_search_knowledge", "tool_index_knowledge",
@@ -88,14 +88,18 @@ def test_agent_core():
     ]
     for name in expected:
         assert name in core_names, f"{name} missing from core tools"
+    # 工具总数会随 MCP 懒连接变化（Filesystem/SearXNG/RPA），这里只要求核心齐全。
+    all_tools = get_all_tools()
+    assert len(all_tools) >= len(expected), f"Expected at least {len(expected)} total tools, got {len(all_tools)}"
     print(f"    Core: {len(core)} tools, All: {len(all_tools)} tools")
 
-@check("MiMo LLM instantiation")
-def test_mimo_adapter():
-    from agent.core import create_mimo_llm
-    from config import MIMO_MODEL
-    llm = create_mimo_llm(model=MIMO_MODEL, temperature=0)
-    assert llm is not None
+@check("OpenAI client factory")
+def test_client_factory():
+    from agent.client_factory import get_async_openai_client
+    client = get_async_openai_client()
+    assert client is not None
+    from config import LLM_FLASH_MODEL
+    assert LLM_FLASH_MODEL, "LLM_FLASH_MODEL not set"
 
 @check("agent state TypedDict")
 def test_agent_state():
@@ -111,17 +115,11 @@ print("=" * 60)
 
 @check("RPA tools: every param has description")
 def test_rpa_schemas():
-    from skills.rpa_ziniao import (
-        rpa_click, rpa_scroll, rpa_navigate, rpa_wait,
-        rpa_fill_input, rpa_extract_tables,
-        rpa_kill_process, rpa_update_core,
-        rpa_close_store, rpa_query_campaign_spend,
+    from skills.rpa.adapters import (
+        rpa_query_campaign_spend, rpa_collect_amazon_review, rpa_update_track_table,
     )
     rpa_tools = [
-        rpa_click, rpa_scroll, rpa_navigate, rpa_wait,
-        rpa_fill_input, rpa_extract_tables,
-        rpa_kill_process, rpa_update_core,
-        rpa_close_store, rpa_query_campaign_spend,
+        rpa_query_campaign_spend, rpa_collect_amazon_review, rpa_update_track_table,
     ]
     missing = []
     for t in rpa_tools:
@@ -149,20 +147,15 @@ def test_skill_schemas():
     assert not missing, f"Missing descriptions: {missing}"
     print("    code_executor skill, all params have descriptions")
 
-@check("RPA no-arg tools have valid schemas")
-def test_no_arg_tools():
-    from skills.rpa_ziniao import (
-        rpa_start_browser, rpa_exit_client,
-        rpa_store_list, rpa_page_summary,
+@check("RPA batch tools have valid schemas")
+def test_batch_tools():
+    from skills.rpa.adapters import (
+        rpa_query_campaign_spend, rpa_collect_amazon_review, rpa_update_track_table,
     )
-    for t in [rpa_start_browser, rpa_exit_client, rpa_store_list, rpa_page_summary]:
+    for t in [rpa_query_campaign_spend, rpa_collect_amazon_review, rpa_update_track_table]:
         assert t.name
         assert t.description
-        schema = t.args_schema.model_json_schema()
-        # no-arg tools should have empty or near-empty properties
-        props = schema.get("properties", {})
-        if props:
-            print(f"    Note: {t.name} has properties: {list(props.keys())}")
+        t.args_schema.model_json_schema()
 
 print()
 print("=" * 60)
@@ -191,55 +184,39 @@ print("=" * 60)
 print("Stage 4: Live agent interaction")
 print("=" * 60)
 
-@check("simple agent call (no tools needed)")
-async def test_agent_call():
+@check("live agent interaction (greeting + tool call)")
+async def test_live_agent():
+    """两个 live 调用必须在同一个事件循环里跑：get_agent() 返回进程级单例，
+    其内部资源（如 aiosqlite 的 Lock）绑定首个 asyncio.run 的 loop，
+    再起一个 asyncio.run 会报 "Lock bound to a different event loop"。"""
     from agent.graph import get_agent
     from langchain_core.messages import HumanMessage
 
     agent = await get_agent(context_summary="")
-    config = {"configurable": {"thread_id": "test-verify-001"}}
+    msgs = []
 
+    # 1) 简单问候（无需工具）
     result = await agent.ainvoke(
         {"messages": [HumanMessage(content="你好，请用一句话介绍你自己")]},
-        config=config,
+        config={"configurable": {"thread_id": "test-verify-001"}},
     )
+    for m in result.get("messages", []):
+        if m.type == "ai" and m.content:
+            msgs.append(m)
+    assert msgs, "No response messages"
 
-    msgs = result.get("messages", [])
-    assert len(msgs) > 0, "No response messages"
-
-    for msg in msgs:
-        if msg.type == "ai" and msg.content:
-            content_preview = str(msg.content)[:200].encode("ascii", errors="replace").decode()
-            model_name = getattr(msg, "response_metadata", {}).get("model_name", "?")
-            print(f"    Model: {model_name}")
-            print(f"    Response: {content_preview}")
-
-@check("agent call that triggers a tool call")
-async def test_tool_call():
-    from agent.graph import get_agent
-    from langchain_core.messages import HumanMessage
-
-    agent = await get_agent(context_summary="")
-    config = {"configurable": {"thread_id": "test-verify-002"}}
-
-    result = await agent.ainvoke(
+    # 2) 触发工具调用的查询（同一 loop 继续）
+    result2 = await agent.ainvoke(
         {"messages": [HumanMessage(content="搜索一下 Python 3.13 的新特性")]},
-        config=config,
+        config={"configurable": {"thread_id": "test-verify-002"}},
     )
-
-    msgs = result.get("messages", [])
-    assert len(msgs) > 0
-    for msg in msgs:
-        if msg.type == "ai":
-            tc_count = len(getattr(msg, "tool_calls", []) or [])
-            tool_names = [tc["name"] for tc in (getattr(msg, "tool_calls", []) or [])]
-            print(f"    Tool calls: {tc_count} {tool_names}")
-            if msg.content:
-                preview = str(msg.content)[:150].encode("ascii", errors="replace").decode()
-                print(f"    Content preview: {preview}")
-        elif msg.type == "tool":
-            preview = str(msg.content)[:100].encode("ascii", errors="replace").decode()
-            print(f"    Tool result: {msg.name} -> {preview}")
+    tool_calls = 0
+    for m in result2.get("messages", []):
+        if m.type == "ai":
+            tool_calls += len(getattr(m, "tool_calls", []) or [])
+        elif m.type == "tool":
+            tool_calls += 1
+    print(f"    Tool interactions: {tool_calls}")
 
 print()
 print("=" * 60)

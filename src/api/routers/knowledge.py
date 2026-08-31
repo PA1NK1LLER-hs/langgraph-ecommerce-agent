@@ -177,6 +177,9 @@ async def api_kb_upload(
         parsed_doc, chunks = await asyncio.to_thread(
             parse_file, str(dest), chunk_strategy=chunk_strategy
         )
+        # 图片文档：用视觉模型生成描述替换占位符分块，让检索能命中图片内容
+        from agent.vision import enrich_image_chunks
+        chunks = await enrich_image_chunks(parsed_doc, chunks)
         total_chunks = len(chunks)
 
         _index_progress[task_id].update({"status": "indexing", "progress": 20, "total_chunks": total_chunks})
@@ -304,10 +307,11 @@ async def api_get_source_chunks(
         limit: 返回条数上限。
     """
     try:
-        from rag import async_search_knowledge
-        # LightRAG 不直接支持按 source 过滤分块，用搜索代替
-        results = await async_search_knowledge(source_id, top_k=limit)
-        chunks = results.get("results", [])
+        from rag.indexer import get_indexer
+        # 返回该来源的真实分块（按 chunk_order_index 排序），而非语义搜索的近似结果
+        chunks = await get_indexer()._list_source_chunks_async(source_id)
+        # 截取前 limit 条（真实分块已按顺序排列，无需 top_k 语义截断）
+        chunks = chunks[:limit]
         return {
             "status": "success",
             "source": source_id,
@@ -396,6 +400,9 @@ async def api_reindex(
 
         _index_progress[task_id].update({"status": "parsing", "progress": 10})
         parsed_doc, chunks = await asyncio.to_thread(parse_file, str(dest), chunk_strategy="semantic")
+        # 图片文档：用视觉模型生成描述替换占位符分块，让检索能命中图片内容
+        from agent.vision import enrich_image_chunks
+        chunks = await enrich_image_chunks(parsed_doc, chunks)
         total = len(chunks)
 
         indexed = 0

@@ -53,11 +53,13 @@ class StdioTransportConfig:
 class StreamableHttpTransportConfig:
     """Streamable HTTP 传输配置（MCP 2025-03-26）。
 
-    url: MCP Server 的 Streamable HTTP 端点 URL（如 /mcp）
+    url:     MCP Server 的 Streamable HTTP 端点 URL（如 /mcp）
+    headers: 附加 HTTP 请求头（如 {"X-RPA-Token": "..."}），用于远程部署鉴权
     """
 
     type: Literal["streamable_http"] = "streamable_http"
     url: str = ""
+    headers: dict[str, str] | None = None
 
 
 TransportConfig = StdioTransportConfig | StreamableHttpTransportConfig
@@ -78,12 +80,26 @@ def _create_transport(config: TransportConfig):
 
         from mcp.client.streamable_http import streamable_http_client
 
-        cm = streamable_http_client(url=config.url)
+        # 远程部署鉴权：SDK 允许注入自定义 http_client（带自定义头），
+        # 例如 RPA MCP server 设置 RPA_MCP_TOKEN 后需携带 X-RPA-Token 头。
+        http_client = None
+        if config.headers:
+            import httpx2
+
+            http_client = httpx2.AsyncClient(headers=config.headers)
+
+        cm = streamable_http_client(url=config.url, http_client=http_client)
 
         @asynccontextmanager
         async def _adapt():
-            async with cm as (read, write, _get_session_id):
-                yield read, write
+            # MCP SDK 2.0.0 的 streamable_http_client 只 yield (read_stream, write_stream)，
+            # 不再返回 get_session_id。
+            try:
+                async with cm as (read, write):
+                    yield read, write
+            finally:
+                if http_client is not None:
+                    await http_client.aclose()
 
         return _adapt()
     raise ValueError(f"Unknown transport type: {config.type}")
@@ -268,10 +284,16 @@ class MCPToolImporter:
 
         transport_cm = _create_transport(self._config)
         self._transport_ctx = transport_cm
-        self._read_stream, self._write_stream = await transport_cm.__aenter__()
-        self._session = ClientSession(self._read_stream, self._write_stream)
-        await self._session.__aenter__()
-        await self._session.initialize()
+        try:
+            self._read_stream, self._write_stream = await transport_cm.__aenter__()
+            self._session = ClientSession(self._read_stream, self._write_stream)
+            await self._session.__aenter__()
+            await self._session.initialize()
+        except BaseException:
+            # 半建立的连接需清理，否则悬挂的 async generator 会在 GC 时触发
+            # anyio「Attempted to exit cancel scope」噪音（Python 3.14 asyncio）。
+            await self.disconnect()
+            raise
         self._connected = True
         logger.info("MCP session connected (%s)", self._config.type)
 

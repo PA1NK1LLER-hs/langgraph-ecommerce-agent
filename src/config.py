@@ -11,9 +11,17 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "")
 LLM_FLASH_MODEL = os.getenv("LLM_FLASH_MODEL", "")
 
+# ── 视觉模型（多模态：文本+图片 → 文本）──
+# deepseek-v4-flash-vision-exp 与主 LLM 同 base_url/key，默认复用；需要独立
+# 视觉网关时单独设 VISION_API_KEY / VISION_BASE_URL。VISION_ENABLED=false 可整体关停。
+VISION_ENABLED = os.getenv("VISION_ENABLED", "true").lower() in ("1", "true", "yes")
+VISION_MODEL = os.getenv("VISION_MODEL", "deepseek-v4-flash-vision-exp")
+VISION_API_KEY = os.getenv("VISION_API_KEY") or LLM_API_KEY
+VISION_BASE_URL = os.getenv("VISION_BASE_URL") or LLM_BASE_URL
+
 
 def display_model_name(key: str) -> str:
-    """把内部模型路由键（flash/pro）映射为 .env 配置的真实模型名。
+    """把内部模型路由键（flash/pro/vision）映射为 .env 配置的真实模型名。
 
     图内部用 "flash"/"pro" 标记由哪个模型生成了消息；对外（WS 事件、
     历史消息 API）应展示真实模型 ID，而不是内部键。
@@ -22,6 +30,8 @@ def display_model_name(key: str) -> str:
         return LLM_FLASH_MODEL or key
     if key == "pro":
         return LLM_MODEL or key
+    if key == "vision":
+        return VISION_MODEL or key
     return key
 
 # ── Embedding 服务（OpenAI 兼容端点）──
@@ -45,6 +55,15 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password123")
 
 # LightRAG
 LIGHTRAG_WORKING_DIR = os.getenv("LIGHTRAG_WORKING_DIR", str(Path(__file__).parent / "data" / "lightrag"))
+
+# RAG 检索注入上下文的最大分块数（search_rag_node 的 top_k）。此前硬编码 5，
+# 超过 5 个相关分块时会被截断（「单分块只含一条记录」的数据形态下会漏召回）。
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "10"))
+
+# RAG 检索模式：dense=纯语义检索（LightRAG mix），hybrid=BM25 关键词 + 语义 RRF 融合。
+# 2026-08-17 已切主链路到 hybrid：对精确 ASIN/SKU/产品名关键词能补 dense 漏召，
+# 对「负责人→产品」类查表问题与 dense 等价（实测）。回退纯 dense 设 RAG_MODE=dense。
+RAG_MODE = os.getenv("RAG_MODE", "hybrid")
 
 # 数据目录
 DATA_DIR = os.getenv("DATA_DIR", str(Path(__file__).parent / "data"))

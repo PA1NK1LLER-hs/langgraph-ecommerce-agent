@@ -6,6 +6,7 @@
 
 import asyncio
 import logging
+import uuid
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,42 @@ def _run_async(coro):
     return future.result()
 
 
+def _clean_context(text: str) -> str:
+    """清洗 LightRAG 合并上下文字符串：去掉 [N] 索引、<SEP> 分隔符、代码围栏、多余空行。
+
+    LightRAG local 模式返回的合并上下文常夹带引用标记与分隔符，直接进入
+    提示词会造成乱码/污染。此处统一清洗后再返回给调用方。
+    """
+    import re
+    if not text:
+        return ""
+    # 去掉行首的 [数字] 引用标记
+    text = re.sub(r"^\s*\[\d+\]\s*", "", text, flags=re.MULTILINE)
+    # <SEP> 分隔符 → 换行
+    text = text.replace("<SEP>", "\n")
+    # 代码围栏（```python 等）
+    text = re.sub(r"```[a-zA-Z0-9_-]*", "", text)
+    # 折叠多余空行
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# 行级切分时，同一文件的多个数据行以「文件名::Sheet::行号」作为唯一 file_path 入库，
+# 以绕过 LightRAG 按 file_path 判重（否则同文件的多行会被误判为「文件名重复」而只索引
+# 第一行）。此处用「::」作分隔——Windows 文件名与 Excel sheet 名均不允许冒号，故安全。
+ROW_DELIMITER = "::"
+
+
+def _clean_source_name(file_path: str) -> str:
+    """从行级切分的 file_path 还原干净文件名（去掉 ``::Sheet::行号`` 后缀）。
+
+    对非行级切分的普通来源（无 ``::``）原样返回，因此对 upload/reindex 路径透明。
+    """
+    if not file_path:
+        return "unknown"
+    return file_path.split(ROW_DELIMITER)[0]
+
+
 # ---------------------------------------------------------------------------
 # LLM Flash 函数（供 LightRAG 做实体/关系抽取及关键词提取）
 # 使用通用 LLM_FLASH_MODEL，切换厂商只需改 .env
@@ -84,22 +121,71 @@ async def _llm_complete(
 # Rerank 函数（供 LightRAG 做精排）
 # ---------------------------------------------------------------------------
 
+_RERANK_POOL_IDLE_SECONDS = 30.0  # 连接池空闲超过该秒数才清池（应短于服务端 keep-alive 闲置超时）
+_rerank_last_use = 0.0
+
+
+def _reset_rerank_pool_if_idle() -> None:
+    """连接池空闲超时后才清池，避免频繁清池带来的重复 TLS 握手开销。
+
+    根因（已定位到 SDK 源码）：dashscope 的 http_request 模块用进程级共享
+    requests.Session 做连接池（`_get_shared_sync_session`，注释明确「never closed
+    explicitly」），长运行后旧 keep-alive 连接被远端/NAT 闲置超时掐断，再次复用
+    即 ConnectionResetError 10054。实测 Connection: close 头在本网关不可靠（服务端
+    不回显），故用「空闲超时清池」策略：高频连续查询复用连接（实测 ~0.4s/次），
+    空闲超过阈值才 pm.clear() 重建连接（~2s/次，但只发生在闲置后的首次查询，且
+    杜绝了 20s 级的 ConnectionReset 卡顿）。该 Session 进程全局，仅 rerank 走
+    dashscope 同步调用（LLM/embedding 走 openai SDK），互不影响。
+    """
+    global _rerank_last_use
+    import time as _time
+    now = _time.monotonic()
+    if _rerank_last_use and (now - _rerank_last_use) < _RERANK_POOL_IDLE_SECONDS:
+        _rerank_last_use = now
+        return
+    try:
+        from dashscope.api_entities import http_request
+        sess = http_request._get_shared_sync_session()
+        for adapter in sess.adapters.values():
+            pm = getattr(adapter, "poolmanager", None)
+            if pm is not None and hasattr(pm, "clear"):
+                pm.clear()
+    except Exception:
+        pass
+    _rerank_last_use = now
+
+
 async def _rerank(
     query: str,
     documents: list[str],
     top_n: int,
 ) -> list[dict]:
     from dashscope import TextReRank
+    import requests as _requests
 
-    resp = TextReRank.call(
-        api_key=RERANK_API_KEY,
-        model=RERANK_MODEL,
-        query=query,
-        documents=documents,
-        top_n=top_n,
-    )
+    _reset_rerank_pool_if_idle()
+    # 同步阻塞调用放线程池，避免冻结事件循环；连接抖动时重试一次
+    resp = None
+    for attempt in (1, 2):
+        try:
+            resp = await asyncio.to_thread(
+                TextReRank.call,
+                api_key=RERANK_API_KEY,
+                model=RERANK_MODEL,
+                query=query,
+                documents=documents,
+                top_n=top_n,
+            )
+            break
+        except (_requests.exceptions.RequestException, OSError) as exc:
+            # ConnectionResetError 等网络层错误：重试一次，仍失败则回退原始分块
+            if attempt == 2:
+                logger.warning("rerank 连续两次失败，回退原始分块: %s", exc)
+                return []
+            await asyncio.sleep(0.2)
+
     results = []
-    if resp.output:
+    if resp is not None and resp.output:
         for r in resp.output.get("results", []):
             results.append({
                 "index": r["index"],
@@ -138,9 +224,9 @@ class KnowledgeIndexer:
             graph_storage="Neo4JStorage",
             kv_storage="JsonKVStorage",
             doc_status_storage="JsonDocStatusStorage",
-            embedding_batch_num=10,
-            embedding_func_max_async=2,
-            llm_model_max_async=2,
+            embedding_batch_num=30,
+            embedding_func_max_async=4,
+            llm_model_max_async=8,
             default_llm_timeout=120,
             vector_db_storage_cls_kwargs={
                 "cosine_better_than_threshold": 0.2,
@@ -172,6 +258,19 @@ class KnowledgeIndexer:
 
         if self._rag._storages_status.value != "initialized":
             await self._rag.initialize_storages()
+
+    async def _invalidate_cache(self) -> None:
+        """KB 内容变更后失效语义缓存，避免同一问题重复问返回陈旧答案。
+
+        call_model 节点按 user_text 精确命中缓存（TTL 3600s），若不清空，
+        上传/删除/重建知识库后用户再问同一个问题，会直接拿到旧回答（跳过
+        RAG 检索与 LLM）。此方法幂等，Redis 不可用时静默降级。
+        """
+        try:
+            from cache.semantic_cache import get_cache
+            await get_cache().clear()
+        except Exception:
+            logger.debug("语义缓存失效失败", exc_info=True)
 
     # ------------------------------------------------------------------
     # 公开 API（与旧接口兼容）
@@ -218,11 +317,16 @@ class KnowledgeIndexer:
         tags: str = "",
         user_id: str = "",
         extra_metadata: dict[str, Any] | None = None,
+        doc_id: str | None = None,
     ):
         await self._ensure_initialized_async()
-        kwargs = {}
-        if source:
-            kwargs["file_paths"] = [source]
+        # 关键：file_path 必须唯一。LightRAG 1.5.x 入库时按 file_path（文件名）判重，
+        # 同一文件的多行若共用干净文件名，除第一行外都会被误判为「文件名重复」而丢弃。
+        # doc_id 缺失时（upload/reindex/import-url/tool 逐块入库）自动追加唯一后缀，
+        # 展示/删除时再用 _clean_source_name 还原干净文件名。
+        unique_fp = doc_id or (f"{source}::{uuid.uuid4().hex}" if source else None)
+        ids = [unique_fp] if unique_fp else None
+        file_paths = [unique_fp] if unique_fp else None
         # 注意: LightRAG 1.5.x 不支持 addon_params 等自定义元数据参数，
         # tags / user_id / extra_metadata 目前仅记录日志供以后升级使用。
         if tags or user_id or extra_metadata:
@@ -231,7 +335,57 @@ class KnowledgeIndexer:
                 "tags=%s user_id=%s metadata=%s",
                 tags, user_id, extra_metadata,
             )
-        await self._rag.ainsert(text, **kwargs)
+        # process_options="!"（skip_kg）：只切分 + 向量化，跳过 LLM 实体/关系抽取。
+        # 表格类数据（产品明细/对照表）无需知识图谱，抽取既慢（易 LLM 超时）又产生
+        # 「Sheet1」这类噪声实体；向量分块检索已足够支撑「负责人→产品」等查表类问题。
+        await self._rag.apipeline_enqueue_documents(
+            text,
+            ids=ids,
+            file_paths=file_paths,
+            process_options="!",
+        )
+        await self._rag.apipeline_process_enqueue_documents()
+        await self._invalidate_cache()
+        await self._sync_bm25_source_async(source)
+
+    async def _index_rows_async(
+        self,
+        rows: list[tuple[str, str, str]],
+        batch_size: int = 50,
+    ) -> int:
+        """批量行级索引 — 把多行合并到一次管道调用。
+
+        每行 ``(text, source, doc_id)``：source 是干净文件名，doc_id 唯一
+        （文件名::Sheet::行号）。逐行入库时，JsonKVStorage 每处理一个文档就
+        整库写盘一次（实体/关系 JSON 随行数增长，整体 O(n²)）。批量入库把多行
+        交给一次管道处理，持久化按批摊薄。
+
+        用 process_options="!"（skip_kg）跳过 LLM 实体/关系抽取：表格类数据
+        抽取每行要数秒且常超时（240s），2899 行全量抽取需数天；跳过抽取后只做
+        切分 + 向量化，几分钟即可完成，向量分块检索已足够支撑查表类问题。
+
+        Returns: 实际索引的文本行数。
+        """
+        await self._ensure_initialized_async()
+        total = 0
+        for start in range(0, len(rows), batch_size):
+            batch = rows[start:start + batch_size]
+            texts = [r[0] for r in batch]
+            ids = [r[2] for r in batch]
+            # file_path 用唯一 doc_id 绕过去重；展示/删除时 _clean_source_name 还原干净文件名
+            await self._rag.apipeline_enqueue_documents(
+                texts,
+                ids=ids,
+                file_paths=ids,
+                process_options="!",
+            )
+            await self._rag.apipeline_process_enqueue_documents()
+            total += len(texts)
+        await self._invalidate_cache()
+        # 同步 BM25：入库走 LightRAG 二次切分，最终分块以 text_chunks 为准
+        for _src in {r[1] for r in rows if r[1]}:
+            await self._sync_bm25_source_async(_src)
+        return total
 
     def search(
         self,
@@ -259,6 +413,54 @@ class KnowledgeIndexer:
             "count": 1,
         }
 
+    # 全中文短问改用本地关键词的字符数阈值（超过则走 LLM 关键词提取）
+    _LOCAL_KEYWORD_MAX_LEN = 100
+
+    @staticmethod
+    def _should_use_local_keywords(query: str) -> bool:
+        """判断是否用本地关键词（跳过 LLM 关键词提取）。
+
+        规则（方案B自适应）：
+          - 全中文 且 长度 ≤ 100 字 → 本地关键词（LLM 关键词提取是查询耗时主因）
+          - 含英文（中英混合）或 超过 100 字 → LLM 关键词提取（本地 bigram 覆盖不足）
+        """
+        import re
+        if len(query) > KnowledgeIndexer._LOCAL_KEYWORD_MAX_LEN:
+            return False
+        return not re.search(r"[a-zA-Z]", query)
+
+    @staticmethod
+    def _local_keywords(query: str) -> list[str]:
+        """本地关键词生成：中文 bigram+trigram + 英文/数字词，去重保序。
+
+        用于全中文短问的提速——LLM 关键词提取是查询耗时主因（冷启动 17-35s），
+        对短中文查询用字符级 n-gram 生成候选关键词，近零开销。
+        bigram 覆盖二字词，trigram 覆盖三字人名/术语（如「郑钰莹」整体命中）。
+
+        注意：LightRAG local 模式只用 ll_keywords 检索图实体；向量分块检索仍用
+        完整 query 的 embedding，因此这里的关键词只影响图实体召回，不影响向量分块召回。
+        """
+        import re
+        tokens: list[str] = []
+        segments = re.split(r"([a-zA-Z0-9]+)", query)
+        for seg in segments:
+            if not seg:
+                continue
+            if re.match(r"[a-zA-Z0-9]+", seg):
+                tokens.append(seg.lower())
+            else:
+                seg = re.sub(r"\s+", "", seg)
+                for n in (2, 3):
+                    for i in range(len(seg) - n + 1):
+                        tokens.append(seg[i:i + n])
+        seen: set[str] = set()
+        out: list[str] = []
+        for t in tokens:
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out[:100]
+
     async def _search_async(
         self,
         query: str,
@@ -269,11 +471,25 @@ class KnowledgeIndexer:
     ) -> str:
         await self._ensure_initialized_async()
         try:
+            # 方案B提速：全中文短问用本地关键词跳过 LLM 关键词提取（耗时主因），
+            # 含英文/超长问改走 LLM 关键词提取。若本地关键词为空（极短输入）则
+            # 不传，让 LightRAG 回退到默认提取。
+            param_kwargs: dict[str, Any] = {}
+            if self._should_use_local_keywords(query):
+                local_kws = self._local_keywords(query)
+                if local_kws:
+                    param_kwargs["ll_keywords"] = local_kws
+                    logger.debug("本地关键词（跳过 LLM 提取）: %s", local_kws[:10])
+
+            # 用 mix 而非 local：入库用 process_options="!"（skip_kg）跳过了实体/关系
+            # 抽取，图是空的，local 模式只检索图实体会返回空。mix 模式在图实体/关系
+            # 为空时仍会做向量分块检索（_get_vector_context），正是表格类查表问题所需。
             param = QueryParam(
-                mode="local",
+                mode="mix",
                 only_need_context=True,
                 top_k=top_k,
                 enable_rerank=use_rerank,
+                **param_kwargs,
             )
             result = await self._rag.aquery(query, param=param)
         except Exception as exc:
@@ -284,6 +500,67 @@ class KnowledgeIndexer:
             result = await self._neo4j_fallback_search(query, top_k)
         return result
 
+    @staticmethod
+    def _parse_lightrag_document_chunks(context: str) -> list[dict[str, Any]]:
+        """从 LightRAG local 模式返回里解析真实的 Document Chunks JSON 块。
+
+        LightRAG 1.5.x 返回结构（尾部）：
+            Document Chunks (...):
+            ```json
+            {"reference_id": "1", "content": "..."}
+            {"reference_id": "2", "content": "..."}
+            ```
+            Reference Document List (...):
+            [1] 各站点ASIN-评论星级用.xlsx
+            [2] 各站点ASIN-评论星级用 - 天安.xlsx
+
+        这里提取每行 JSON 的 content 作为分块，并把 reference_id 映射成真实文件名
+        作为 source。此前用正则 `[数字]` 匹配「原文片段」时，会误把末尾 Reference
+        Document List 里的 `[1] 文件名` 当成 chunk 内容，导致真正的表格内容被丢弃、
+        只剩下文件名（例如「郑钰莹」人名查得回来但内容为空）。
+        """
+        import json as _json
+        import re as _re
+
+        # 1. Reference Document List → {ref_id: 文件名}
+        ref_map: dict[str, str] = {}
+        ref_block = _re.search(
+            r"Reference Document List[^\n]*:\s*\n+```?\s*\n(.*?)```",
+            context, _re.DOTALL,
+        )
+        if ref_block:
+            for line in ref_block.group(1).splitlines():
+                m = _re.match(r"\[(\d+)\]\s+(.+)", line.strip())
+                if m:
+                    ref_map[m.group(1)] = m.group(2).strip()
+
+        # 2. Document Chunks 的 ```json 块 → 逐行解析 content
+        chunks: list[dict[str, Any]] = []
+        m = _re.search(
+            r"Document Chunks[^\n]*:\s*\n+```json\s*\n(.*?)```",
+            context, _re.DOTALL,
+        )
+        if not m:
+            return chunks
+        for line in m.group(1).splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = _json.loads(line)
+            except Exception:
+                continue
+            content = str(obj.get("content", "") or "").strip()
+            if not content:
+                continue
+            ref_id = str(obj.get("reference_id", ""))
+            chunks.append({
+                "content": content,
+                "source": _clean_source_name(ref_map.get(ref_id, "")),
+                "chunk_id": ref_id,
+            })
+        return chunks
+
     async def _search_structured_async(
         self,
         query: str,
@@ -292,44 +569,58 @@ class KnowledgeIndexer:
     ) -> list[dict[str, Any]]:
         """结构化检索 — 返回分块列表（含 source 和 score）。
 
-        尝试从 LightRAG 检索结果中提取真实的相关度分数和来源信息。
-        当 LightRAG 返回合并字符串时，从 doc_status / graph 中重建结构化结果。
+        优先解析 LightRAG local 模式返回的 Document Chunks（真实分块 + 来源文件）；
+        失败时回退到 Neo4j 兜底格式的「## 原文片段」；再失败按段落切分。
         """
         context = await self._search_async(query, top_k, use_rerank=use_rerank)
         if not context or "[no-context]" in context:
             return []
 
-        # LightRAG local 模式返回合并上下文字符串，无分块边界
-        # 尝试从 Neo4j fallback 路径的格式解析（该路径有 ## 标记的结构）
         results: list[dict[str, Any]] = []
 
-        # 尝试解析 Neo4j fallback 格式的原文片段
-        import re as _re
-        chunk_matches = _re.findall(
-            r"\[(\d+)\]\s+(.{20,500}?)(?=\n\[|\n##|\Z)",
-            context, _re.DOTALL,
-        )
-        if chunk_matches:
-            for idx, snippet in chunk_matches:
+        # 优先：LightRAG Document Chunks JSON（含真实内容与来源）
+        # 注意：不要用 2000 这类小上限截断——表格类 chunk 会把整张 sheet 塞进一个
+        # chunk（可达数千字符），人名/产品行常落在 chunk 末尾，截断会丢数据
+        #（例如「郑钰莹」5 行产品在 2590 字符的 chunk 第 1834 字符起，2000 截断只剩 3 行）。
+        chunks = self._parse_lightrag_document_chunks(context)
+        if chunks:
+            for i, c in enumerate(chunks[:top_k]):
                 results.append({
-                    "content": snippet.strip(),
-                    "score": 0.5,  # 默认中等分数
-                    "source": "neo4j_graph",
-                    "chunk_id": idx,
+                    "content": _clean_context(c["content"])[:8000],
+                    "score": 0.7 - (i * 0.03),  # 降序伪分数
+                    "source": c["source"] or "lightrag",
+                    "chunk_id": c["chunk_id"],
                 })
             return results
 
-        # 回退：按双换行拆分合并字符串为伪分块
+        # 回退 1：Neo4j fallback 的「## 原文片段」里的 [数字] 片段
+        import re as _re
+        src_sec = _re.search(r"##\s*原文片段\s*\n(.*)", context, _re.DOTALL)
+        if src_sec:
+            chunk_matches = _re.findall(
+                r"\[(\d+)\]\s+(.{20,500}?)(?=\n\[|\Z)",
+                src_sec.group(1), _re.DOTALL,
+            )
+            if chunk_matches:
+                for idx, snippet in chunk_matches:
+                    results.append({
+                        "content": _clean_context(snippet),
+                        "score": 0.5,
+                        "source": "neo4j_graph",
+                        "chunk_id": idx,
+                    })
+                return results
+
+        # 回退 2：按双换行拆分合并字符串为伪分块
         paragraphs = [p.strip() for p in context.split("\n\n") if p.strip() and not p.startswith("##")]
-        # 优先取非标题行
         content_paragraphs = [p for p in paragraphs if len(p) > 50]
         if not content_paragraphs:
             content_paragraphs = paragraphs
 
         for i, para in enumerate(content_paragraphs[:top_k]):
             results.append({
-                "content": para[:1000],  # 最多 1000 字符
-                "score": 0.7 - (i * 0.05),  # 降序伪分数
+                "content": _clean_context(para[:1000]),
+                "score": 0.7 - (i * 0.05),
                 "source": "lightrag",
                 "chunk_id": str(i),
             })
@@ -466,21 +757,133 @@ class KnowledgeIndexer:
         docs = await self._rag.doc_status.get_docs_by_statuses([
             DocStatus.PROCESSED, DocStatus.PROCESSING, DocStatus.PENDING, DocStatus.FAILED,
         ])
-        seen: set[str] = set()
-        sources: list[dict[str, Any]] = []
+        # 行级切分后同一文件会拆成多个文档（每个数据行一个 doc_id，file_path 为
+        # 「文件名::Sheet::行号」）。这里按干净文件名聚合，让来源列表保持「一个文件
+        # 一条」，并累加 chunks/content_length。
+        grouped: dict[str, dict[str, Any]] = {}
         for doc in docs.values():
             fp = getattr(doc, "file_path", "") or "unknown"
-            if fp not in seen:
-                seen.add(fp)
-                sources.append({
-                    "source": fp,
-                    "chunks": getattr(doc, "chunks_count", 1) or 1,
-                    "content_length": getattr(doc, "content_length", 0) or 0,
+            clean = _clean_source_name(fp)
+            if clean not in grouped:
+                grouped[clean] = {
+                    "source": clean,
+                    "chunks": 0,
+                    "content_length": 0,
                     "summary": getattr(doc, "content_summary", "") or "",
                     "status": getattr(doc, "status", "unknown"),
                     "indexed_at": getattr(doc, "created_at", "") or "",
-                })
-        return sources
+                }
+            grouped[clean]["chunks"] += getattr(doc, "chunks_count", 1) or 1
+            grouped[clean]["content_length"] += getattr(doc, "content_length", 0) or 0
+        return list(grouped.values())
+
+    async def _list_source_chunks_async(self, source: str) -> list[dict[str, Any]]:
+        """列出指定来源（干净文件名）的真实分块，按 chunk_order_index 排序。
+
+        直接读 text_chunks KV 存储（每个分块一行，含 full_doc_id / file_path 指向
+        其所属文档），按干净文件名过滤——这才是「查看分块」该返回的数据。此前
+        api_get_source_chunks 用语义搜索冒充，返回的是「与文件名向量最相似」的
+        无关片段（文件名作 query，向量检索召回的是语义近邻而非该文档的分块）。
+        """
+        await self._ensure_initialized_async()
+        text_chunks = self._rag.text_chunks
+        chunks: list[dict[str, Any]] = []
+        try:
+            keys = list(text_chunks._data.keys())
+        except Exception:
+            return chunks
+        for key in keys:
+            row = await text_chunks.get_by_id(key)
+            if not row:
+                continue
+            fp = row.get("full_doc_id") or row.get("file_path") or ""
+            if _clean_source_name(fp) != source:
+                continue
+            content = str(row.get("content") or "").strip()
+            if not content:
+                continue
+            order = row.get("chunk_order_index")
+            chunks.append({
+                "content": content,
+                "source": source,
+                "chunk_id": key,
+                "order": order if isinstance(order, int) else 0,
+            })
+        chunks.sort(key=lambda c: c["order"])
+        return chunks
+
+    async def _read_all_chunks_async(self) -> list[dict[str, Any]]:
+        """读全部最终分块（content/source/chunk_id），供 BM25 重建使用。
+
+        直接遍历 LightRAG text_chunks KV 存储，与 _list_source_chunks_async 同源，
+        但跨全部来源。source 用干净文件名（与删除/引用聚合一致）。
+        """
+        await self._ensure_initialized_async()
+        text_chunks = self._rag.text_chunks
+        chunks: list[dict[str, Any]] = []
+        try:
+            keys = list(text_chunks._data.keys())
+        except Exception:
+            return chunks
+        for key in keys:
+            try:
+                row = await text_chunks.get_by_id(key)
+            except Exception:
+                continue
+            if not row:
+                continue
+            content = str(row.get("content") or "").strip()
+            if not content:
+                continue
+            fp = row.get("full_doc_id") or row.get("file_path") or ""
+            chunks.append({
+                "content": content,
+                "source": _clean_source_name(fp),
+                "chunk_id": key,
+            })
+        return chunks
+
+    async def rebuild_bm25_async(self) -> int:
+        """从 LightRAG text_chunks 重建进程内 BM25 索引（启动/重建后同步）。
+
+        只有 text_chunks 才是 LightRAG 二次切分后的最终分块，故以此为唯一权威源，
+        不在入库链路直接喂原始文本（原始输入会被二次切分，二者不一致）。
+        幂等：text_chunks 为空时保持索引为空并返回 0。
+        """
+        from .retrieval import get_retriever
+        chunks = await self._read_all_chunks_async()
+        if not chunks:
+            logger.warning("BM25 重建：text_chunks 为空，索引保持为空")
+            return 0
+        count = get_retriever().rebuild(
+            [c["content"] for c in chunks],
+            [c["source"] for c in chunks],
+            [c["chunk_id"] for c in chunks],
+        )
+        logger.info("BM25 索引重建完成: %d 个分块", count)
+        return count
+
+    async def _sync_bm25_source_async(self, source: str) -> None:
+        """运行期入库后，把某来源的最终分块同步进 BM25（先移除旧条目再重加）。
+
+        best-effort：失败只记日志，不影响主索引/删除链路。
+        """
+        if not source:
+            return
+        try:
+            from .retrieval import get_retriever
+            retriever = get_retriever()
+            retriever.remove_source(source)
+            chunks = await self._list_source_chunks_async(source)
+            if not chunks:
+                return
+            retriever.index_texts(
+                [c["content"] for c in chunks],
+                source=source,
+                chunk_ids=[c["chunk_id"] for c in chunks],
+            )
+        except Exception:
+            logger.warning("BM25 同步来源 %s 失败", source, exc_info=True)
 
     def delete_source(self, source: str) -> int:
         """删除指定来源的所有文档。"""
@@ -501,9 +904,14 @@ class KnowledgeIndexer:
         ])
         count = 0
         for doc_id, doc in docs.items():
-            if getattr(doc, "file_path", "") == source:
+            if _clean_source_name(getattr(doc, "file_path", "")) == source:
                 await self._rag.adelete_by_doc_id(doc_id)
                 count += 1
+        if count:
+            await self._invalidate_cache()
+            from .retrieval import get_retriever
+            removed = get_retriever().remove_source(source)
+            logger.info("BM25 移除来源 %s: %d 条", source, removed)
         return count
 
     def count(self) -> int:
@@ -576,27 +984,46 @@ async def async_search_knowledge(
     query: str,
     top_k: int = 5,
     mode: str = "dense",
+    use_rerank: bool = False,
 ) -> dict[str, Any]:
     """异步版检索 — 支持 dense/hybrid 两种模式。
 
     mode="dense": 使用 LightRAG 语义检索（向后兼容）。
-    mode="hybrid": BM25 + LightRAG → RRF 融合 → reranker。
+    mode="hybrid": BM25 + LightRAG → RRF 融合（use_rerank 固定 False，见下）。
+    use_rerank: dense 模式下是否启用 LightRAG 内置 rerank（DashScope）。
+        默认关闭：内置 rerank 走 DashScope 原生端点，长连接在服务长时间运行后
+        会间歇性被远端重置（ConnectionResetError 10054），触发重试拖慢检索；
+        且失败后本就回退「原始分块」。注意：rerank 会重排 chunk 顺序（精排），
+        并非零影响——只是对当前「行级切分的表格库 + 查表类问题」而言，top-5
+        内容基本是同一张表的行，重排后实际答案无实质差异，故默认关闭只省
+        延迟与报错、不丢答案；大库/多文档交叉/长文档场景如需恢复再打开。
     """
     try:
         if mode == "hybrid":
             from .retrieval import get_retriever
             retriever = get_retriever()
-            results = await retriever.search(query, top_k=top_k, mode="hybrid")
+            # use_rerank=False：外层 HybridRetriever._rerank 是同步阻塞的 DashScope 调用，
+            # 走同一个共享 Session（见 rerank-connection-reset 记忆），且 hybrid 的 RRF
+            # 融合后 top-k 对表格库已足够，无需再精排。
+            results = await retriever.search(query, top_k=top_k, mode="hybrid", use_rerank=False)
+            # RRF 分数是倒数排名融合值（k=60 时 ~0.016~0.033），量纲与 dense 的
+            # 降序伪分数（0.7-0.03i）不一致，直接展示会变成「相关度 0.02」误导模型。
+            # 这里按名次重映射成与 dense 一致的降序伪分数，仅用于展示/引用，不改变排序。
+            out = []
+            for i, r in enumerate(results):
+                d = r.to_dict()
+                d["score"] = round(0.7 - i * 0.03, 3)
+                out.append(d)
             return {
                 "status": "success",
-                "results": [r.to_dict() for r in results],
-                "count": len(results),
+                "results": out,
+                "count": len(out),
                 "mode": "hybrid",
             }
 
         # dense mode: 使用结构化检索获取分块结果
         indexer = get_indexer()
-        structured = await indexer._search_structured_async(query, top_k)
+        structured = await indexer._search_structured_async(query, top_k, use_rerank=use_rerank)
         if structured:
             # B4 修复: 返回真实的结构化结果（含 source 和 score）
             return {
@@ -610,7 +1037,7 @@ async def async_search_knowledge(
         context = await indexer._search_async(query, top_k)
         return {
             "status": "success",
-            "results": [{"content": context, "score": 1.0}],
+            "results": [{"content": _clean_context(context or ""), "score": 1.0}],
             "count": 1,
             "mode": "dense",
         }

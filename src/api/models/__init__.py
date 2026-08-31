@@ -1,8 +1,8 @@
-"""用户模型 & 对话线程模型。"""
+"""用户模型 & 对话线程模型 & RPA 任务队列。"""
 from datetime import datetime
 
 import bcrypt
-from sqlalchemy import String, DateTime, Integer, ForeignKey, func
+from sqlalchemy import String, DateTime, Integer, ForeignKey, func, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ..database import Base
@@ -63,3 +63,27 @@ class Thread(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     user: Mapped["User"] = relationship("User", back_populates="threads")
+
+
+class RpaJob(Base):
+    """RPA 任务队列（DB 当队列）— 提交即入队，后台调度器按序认领执行。
+
+    状态流转：queued → running → done / failed。一次认领一个（调度器 + FOR
+    UPDATE SKIP LOCKED），多台 executor 未来可共享此表而不重复取任务。
+    """
+
+    __tablename__ = "rpa_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
+    job_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    params: Mapped[str] = mapped_column(Text, nullable=False, default="{}", server_default="{}")
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="queued", server_default="queued", index=True,
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

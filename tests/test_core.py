@@ -2,7 +2,14 @@
 
 from unittest.mock import patch
 
-from agent.core import create_llm, get_core_tools, get_all_tools
+from agent.core import (
+    create_llm,
+    get_core_tools,
+    get_all_tools,
+    set_session_prompt_tokens,
+    set_context_window_tokens,
+    get_context_remaining_tokens,
+)
 
 
 class TestCreateLLM:
@@ -37,7 +44,8 @@ class TestCreateLLM:
 class TestCoreTools:
     def test_get_core_tools_count(self):
         tools = get_core_tools()
-        assert len(tools) == 9
+        # 基础工具 11 + RPA 提交工具 3（submit_rpa_*） = 14
+        assert len(tools) == 14
 
     def test_core_tool_names(self):
         names = [t.name for t in get_core_tools()]
@@ -49,7 +57,38 @@ class TestCoreTools:
         assert "tool_list_memories" in names
         assert "tool_list_knowledge_sources" in names
 
+    def test_submit_rpa_tools_present(self):
+        names = {t.name for t in get_core_tools()}
+        assert "submit_rpa_query_campaign_spend" in names
+        assert "submit_rpa_collect_amazon_review" in names
+        assert "submit_rpa_update_track_table" in names
+
     def test_get_all_tools_includes_core(self):
         core_names = {t.name for t in get_core_tools()}
         all_names = {t.name for t in get_all_tools()}
         assert core_names <= all_names
+
+
+class TestContextRemaining:
+    """get_context_remaining 元认知工具（借鉴 Codex）。"""
+
+    def teardown_method(self):
+        set_session_prompt_tokens(None)
+
+    def test_none_when_unknown(self):
+        set_session_prompt_tokens(None)
+        assert get_context_remaining_tokens() is None
+
+    def test_remaining_computed(self):
+        set_context_window_tokens(128000)
+        set_session_prompt_tokens(8000)
+        assert get_context_remaining_tokens() == 120000
+
+    def test_floor_zero(self):
+        set_context_window_tokens(100)
+        set_session_prompt_tokens(500)
+        assert get_context_remaining_tokens() == 0
+
+    def test_tool_present_in_core_tools(self):
+        names = {t.name for t in get_core_tools()}
+        assert "tool_get_context_remaining" in names

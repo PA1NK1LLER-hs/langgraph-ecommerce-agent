@@ -15,6 +15,7 @@ from ..rate_limit import ws_limiter, check_ws_rate
 from ..routers.threads import ensure_thread, auto_title_thread
 from agent.graph import get_agent
 from agent.utils import build_memory_injection
+from auth.permissions import get_user_role
 from config import display_model_name
 from context import load_user_context
 
@@ -36,6 +37,7 @@ async def _safe_send(websocket: WebSocket, payload: dict) -> None:
         await websocket.send_json(payload)
     except Exception:
         logger.debug("WS send failed (client disconnected), stream continues for checkpoint")
+
 
 # ── 审批等待超时（秒）──
 try:
@@ -109,7 +111,7 @@ async def _interrupt_still_pending(agent, config: dict) -> bool:
         return True  # 无法验证时保守地认为仍在挂起
 
 
-async def _stream_resume(agent, command, config: dict, websocket: WebSocket) -> None:
+async def _stream_resume(agent, command, config: dict, websocket: WebSocket, thread_id: str = "") -> None:
     """流式恢复执行并处理可能出现的第二个中断。"""
     from langgraph.types import Command
 
@@ -137,7 +139,7 @@ async def _stream_resume(agent, command, config: dict, websocket: WebSocket) -> 
                     logger.info("Second approval interrupt during resume, auto-denying")
                     # 嵌套中断：自动拒绝以避免无限等待
                     from langgraph.types import Command as Cmd2
-                    await _stream_resume(agent, Cmd2(resume="deny"), config, websocket)
+                    await _stream_resume(agent, Cmd2(resume="deny"), config, websocket, thread_id)
                     continue
             await _send_node_output(websocket, node_name, node_output)
 
@@ -180,7 +182,7 @@ async def _run_turn(agent, input_state: dict, config: dict, websocket: WebSocket
                         decision = await _wait_for_approval_decision(websocket, thread_id)
                         # 用 Command(resume=...) 恢复执行
                         from langgraph.types import Command
-                        await _stream_resume(agent, Command(resume=decision), config, websocket)
+                        await _stream_resume(agent, Command(resume=decision), config, websocket, thread_id)
                         continue  # 恢复后的流已处理完毕
 
                 await _send_node_output(websocket, node_name, node_output)
@@ -239,10 +241,12 @@ async def _send_node_output(websocket: WebSocket, node_name: str, node_output: d
             content = getattr(msg, "content", "") or (msg.get("content", "") if isinstance(msg, dict) else str(msg))
             is_err = isinstance(content, dict) and content.get("status") == "error"
             is_denied = isinstance(content, dict) and content.get("status") == "denied"
+            full_content = str(content)
             await _safe_send(websocket, {
                 "type": "tool_result",
                 "tool": str(name),
-                "content": str(content)[:300],
+                "content": full_content[:300],
+                "truncated": len(full_content) > 300,
                 "error": bool(is_err),
                 "denied": bool(is_denied),
             })
@@ -338,9 +342,13 @@ async def ws_chat(websocket: WebSocket):
                 await websocket.send_json({"type": "auth_ok", "content": user is not None})
                 continue
 
-            message = data.get("message", "").strip()
-            if not message:
+            message = (data.get("message") or "").strip()
+            # 可选的多模态图片：前端传 base64 data URI 或 http(s) URL 列表
+            image_uris = data.get("images") or []
+            if not message and not image_uris:
                 continue
+            if not message:
+                message = "请描述/分析这张图片"
 
             # 懒加载 agent（认证可能刚完成，context_injection 已更新）
             if agent is None:
@@ -385,13 +393,24 @@ async def ws_chat(websocket: WebSocket):
                 except Exception:
                     logger.warning("Auto-title failed for thread %s", thread_id, exc_info=True)
 
+            # 多模态消息：文本 + 图片块（图片为空时退化为纯文本 HumanMessage）
+            if image_uris:
+                _content: list = [{"type": "text", "text": message}]
+                for uri in image_uris:
+                    _content.append({"type": "image_url", "image_url": {"url": uri}})
+                user_message = HumanMessage(content=_content)
+            else:
+                user_message = HumanMessage(content=message)
+
             input_state = {
-                "messages": [HumanMessage(content=message)],
+                "messages": [user_message],
                 "plan": "",
                 "tool_failures": 0,
                 "tool_retries": 0,
                 "rag_context": "",
                 "response_schema": data.get("response_schema"),  # 结构化输出请求
+                # 注入用户角色供 agent 做 RBAC 工具权限判断（修复：此前恒被当 viewer）
+                "user_role": get_user_role(user) if user else "viewer",
             }
 
             # 流执行放在独立 task 中，用 shield 保护：

@@ -54,6 +54,15 @@ class RequestIDFilter(logging.Filter):
 
 
 # ── 日志 ──
+# Windows 控制台/日志默认 GBK 编码，无法输出 →/emoji 等字符（日志出现乱码）。
+# 切换为 UTF-8（容错替换），与 main.py 保持一致。
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(request_id)s] %(name)s: %(message)s"
 # force=True 确保 basicConfig 覆盖已有 handler 的格式（uvicorn 可能先初始化）
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, force=True)
@@ -107,9 +116,32 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.exception("Agent startup failed: %s", exc)
 
+        # 预构建 BM25 索引（从 LightRAG text_chunks 重建），供 hybrid 检索使用。
+        # best-effort：失败不影响启动，hybrid 检索届时退化为纯 dense。
+        try:
+            from rag.indexer import get_indexer
+            await get_indexer().rebuild_bm25_async()
+        except Exception as exc:
+            logger.warning("BM25 索引预构建失败（可忽略）: %s", exc)
+
+        # RPA 后台调度器：DB 当队列，把 queued 任务按序推给独立 RPA MCP executor。
+        # best-effort：DB 不可用时任务仍能提交，只是不会被调度（提交方已能看到 503 式错误）。
+        try:
+            from agent.rpa_jobs import get_rpa_dispatcher
+            await get_rpa_dispatcher().start()
+            logger.info("RPA 调度器已启动")
+        except BaseException as exc:
+            # BaseException 而非 Exception：Python 3.14+ 中 CancelledError 不再继承 Exception
+            logger.warning("RPA 调度器启动失败（提交任务将不会执行）: %s", exc)
+
     yield
 
     # ── 关闭 ──
+    try:
+        from agent.rpa_jobs import get_rpa_dispatcher
+        await get_rpa_dispatcher().stop()
+    except BaseException:
+        pass
     await shutdown_mcp_tools()
     logger.info("API shutdown complete")
 
@@ -175,7 +207,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RateLimitMiddleware)
 
 # ── 注册路由 ──
-from api.routers import auth, chat, tools, knowledge, memories, threads, approval
+from api.routers import auth, chat, tools, knowledge, memories, threads, approval, admin, rpa
 
 app.include_router(auth.router)
 app.include_router(chat.router)
@@ -184,6 +216,8 @@ app.include_router(knowledge.router)
 app.include_router(memories.router)
 app.include_router(threads.router)
 app.include_router(approval.router)
+app.include_router(admin.router)
+app.include_router(rpa.router)
 
 
 # ── 统一异常处理（B3）──
