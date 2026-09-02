@@ -4,6 +4,7 @@
 与现有 checkpoint 和 input_state 向后兼容。
 """
 
+import operator
 from typing import Annotated
 
 from langgraph.graph.message import add_messages
@@ -55,6 +56,35 @@ class AgentState(TypedDict, total=False):
     specialist: str                     # 当前活跃的 specialist: researcher|coder|analyst|general
     specialist_history: list[dict]      # 已委派的 specialist 记录 [{specialist, reason, timestamp}]
     specialist_task: str                # supervisor 分解的子任务描述
+    specialist_results: Annotated[list[dict], operator.add]  # 子图执行结果累积 [{specialist, task, status, report, cost}]
+    specialist_started: dict | None     # supervisor 发射的"子代理开始"瞬态标记（供前端事件）
+    specialist_report: dict | None      # run_specialist 发射的"子代理报告"瞬态标记（供前端事件）
 
     # ── 安全 / RBAC ──
     user_role: str                      # 当前用户角色: admin|editor|viewer（默认 viewer）
+
+
+class SpecialistState(TypedDict, total=False):
+    """子代理（specialist 子图）内部状态。
+
+    字段为子图节点写 + 读的并集（langgraph 1.x 对 schema 未声明 key 静默丢弃、
+    读取缺失 channel 报错，因此必须完整声明）。子图无 checkpointer、命令式
+    ainvoke，最终报告与成本由 run_specialist 提取后合并回父 AgentState。
+    """
+
+    messages: Annotated[list, add_messages]
+    session_costs: dict | None          # 子代理内部累计成本（call_model 写入）
+    last_turn_cost: dict | None         # 子代理最近一轮成本
+    iteration_count: int                # 子代理迭代计数（sub_agent_node 上限保护）
+    conversation_summary: str           # 子代理对话摘要
+    tool_failures: int                  # 连续失败计数
+    tool_retries: int                   # 反思重试计数
+    approval_decision: str              # "" | "approved" | "denied"
+    pending_approval: dict | None       # 待审批调用信息
+    denied_tool_calls: list[dict]       # 子代理内被拒绝的调用记录
+    intent: str                         # 路由字段（子图输入固定 "complex" 以走 specialist 绑定分支）
+    selected_tools: list[str]           # 分类器选中工具（子图输入为空）
+    needs_rag: bool                     # 是否需要 RAG（子图输入 False）
+    specialist: str                     # 当前子代理名
+    rag_context: str                    # 检索上下文（子图输入为空，子代理自行检索）
+    user_role: str                      # RBAC 角色（继承父 state）

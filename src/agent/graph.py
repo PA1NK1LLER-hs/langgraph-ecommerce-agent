@@ -16,7 +16,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt
 
-from .state import AgentState
+from .state import AgentState, SpecialistState
 from .core import (
     create_llm,
     create_llm_with_fallback,
@@ -139,6 +139,7 @@ def _sanitize_messages_for_api(messages: list) -> list:
                 all_tool_msg_ids.add(tc_id)
 
     # 第二遍：过滤消息
+    surviving_tool_ids: set[str] = set()  # 保留下来、仍被 ToolMessage 引用的 AI tool_call id
     for m in messages:
         if isinstance(m, AIMessage) and hasattr(m, "tool_calls") and m.tool_calls:
             tool_ids: set[str] = set()
@@ -151,6 +152,7 @@ def _sanitize_messages_for_api(messages: list) -> list:
                 # 检查是否有足够的 ToolMessage 覆盖所有 tool_call_ids
                 if tool_ids.issubset(all_tool_msg_ids):
                     cleaned.append(m)
+                    surviving_tool_ids.update(tool_ids)
                 else:
                     # 孤立的 tool_calls：作为纯文本消息保留（如果有 content）
                     missing = tool_ids - all_tool_msg_ids
@@ -159,6 +161,17 @@ def _sanitize_messages_for_api(messages: list) -> list:
                     )
                     if getattr(m, "content", None):
                         cleaned.append(type(m)(content=m.content))
+                continue
+
+        # 反向防御：孤立的 ToolMessage —— 其对应 AI tool_call 已被摘要压缩/上面清理掉，
+        # 继续保留会触发 DeepSeek 400 "Messages with role 'tool' must be a response to
+        # a preceding message with 'tool_calls'"，整轮 LLM 调用失败。
+        if isinstance(m, ToolMessage):
+            tc_id = getattr(m, "tool_call_id", "") or ""
+            if tc_id and tc_id not in surviving_tool_ids:
+                logger.warning(
+                    "Dropping orphaned ToolMessage (no surviving tool_call for: %s)", tc_id,
+                )
                 continue
 
         cleaned.append(m)
@@ -250,7 +263,9 @@ def _route_after_classify(state: AgentState) -> Literal["supervisor", "query_rew
     if state.get("needs_rag"):
         return "query_rewrite"
     intent = state.get("intent", "complex")
-    if intent == "complex":
+    # code 意图也进 supervisor → coder 子代理（否则代码任务永远由主代理直处理，
+    # coder 子代理不可达）。2026-09-02 冒烟发现后修改。
+    if intent in ("complex", "code"):
         return "supervisor"
     if intent == "trivial":
         return "agent"
@@ -262,7 +277,7 @@ def _route_after_rag(state: AgentState) -> Literal["supervisor", "agent"]:
     intent = state.get("intent", "complex")
     if messages_have_image(state.get("messages", [])):
         return "agent"
-    if intent == "complex":
+    if intent in ("complex", "code"):
         return "supervisor"
     return "agent"
 
@@ -317,6 +332,129 @@ def _route_after_approval(state: AgentState) -> Literal["tools", "agent"]:
         return "agent"  # 跳过工具执行，让 LLM 告知用户
     # "approved" 或无需审批 → 正常执行工具
     return "tools"
+
+
+# ---------------------------------------------------------------------------
+# 真 Sub-Agent（LangGraph 子图）：supervisor 委派 → run_specialist 命令式执行子图
+# ---------------------------------------------------------------------------
+
+
+# 走子图执行的 specialist（general 保持单循环逻辑）
+SUBAGENT_NAMES: set[str] = {"researcher", "coder", "analyst"}
+
+# SessionCosts.to_dict() 的字段集合（graph.py call_model 成本记账使用）
+_COST_KEYS = ("prompt_tokens", "completion_tokens", "cost_usd", "llm_calls", "latency_ms")
+
+
+def _merge_session_costs(a: dict, b: dict) -> dict:
+    """合并两份 session 成本明细（父 state 已累计 + 子代理内部累计）。"""
+    return {k: (a.get(k, 0) or 0) + (b.get(k, 0) or 0) for k in _COST_KEYS}
+
+
+def _extract_subagent_report(messages: list) -> str:
+    """从子图最终 messages 提取子代理最终报告。
+
+    从后向前找第一条无 tool_calls 且有内容的 AI 消息（子代理自然终止时
+    最后一条即最终回答；达到迭代上限时可能是封顶提示）。
+    """
+    for m in reversed(messages):
+        if isinstance(m, AIMessage) and m.content and not getattr(m, "tool_calls", None):
+            return content_to_text(m.content)
+    return ""
+
+
+def _route_after_supervisor(state: AgentState) -> Literal["run_specialist", "planner", "agent"]:
+    """Supervisor 后路由：真 specialist → 子图执行；general 有任务 → planner 规划；否则 agent。"""
+    specialist = state.get("specialist", "")
+    task = state.get("specialist_task", "")
+    if specialist in SUBAGENT_NAMES and task:
+        return "run_specialist"
+    if specialist and task:
+        return "planner"
+    return "agent"
+
+
+async def sub_check_approval(state: AgentState) -> dict:
+    """子代理内审批门控：不 interrupt，高风险调用直接拒绝并引导标注待审批操作。
+
+    与父图 check_approval_node 的区别：子图无 checkpointer，interrupt 无法持久化
+    resume，因此对需审批的调用一律返回 denied ToolMessage，由主代理在子图返回后
+    以 general 身份走现有审批链路执行（安全性不变，能力分两阶段：子代理产出报告 →
+    主代理经用户批准后执行高风险操作）。
+    """
+    import json as _json
+    from langchain_core.messages import ToolMessage
+
+    last_msg = state["messages"][-1]
+    calls = last_msg.tool_calls or []
+    mode = get_approval_mode()
+    risky: list[dict] = []
+    for tc in calls:
+        if isinstance(tc, dict):
+            cid, cname, cargs = tc.get("id", ""), tc.get("name", ""), tc.get("args", {})
+        else:
+            cid, cname, cargs = tc.id, tc.name, tc.args
+        needs, _, _ = classify_tool_risk(cname, mode)
+        if needs:
+            risky.append({"id": cid, "name": cname, "args": cargs})
+    if not risky:
+        return {"approval_decision": ""}
+
+    denied = [
+        ToolMessage(
+            content=_json.dumps({
+                "status": "denied",
+                "message": "此操作需要人工审批，子 Agent 无法直接执行。"
+                           "请在最终报告中明确列出该待审批操作（工具名与参数），由主 Agent 在用户批准后执行。",
+            }, ensure_ascii=False),
+            tool_call_id=c["id"], name=c["name"],
+        ) for c in risky
+    ]
+    prev = list(state.get("denied_tool_calls", []))
+    return {
+        "messages": denied,
+        "approval_decision": "denied",
+        "denied_tool_calls": prev + risky,
+    }
+
+
+def build_specialist_subgraph(
+    *,
+    agent_node,
+    tool_node,
+    reflect_node,
+    track_failures,
+    check_approval_node=sub_check_approval,
+) -> CompiledStateGraph:
+    """构建 specialist 子图（无 checkpointer，命令式 ainvoke）。
+
+    复用父图同一批节点闭包：agent(带迭代上限包装) / tools / reflect / track_failures /
+    sub_check_approval。关键约束（已验证 langgraph 1.2.11 源码）：
+    - 每个 add_node 显式 input_schema=SpecialistState（否则从闭包 `state: AgentState`
+      注解推断 input_schema，编译期抛 ValueError）。
+    - 条件边用 lambda 包一层，避免从 `AgentState` 注解推断分支 schema。
+    - sub.compile(checkpointer=False) 强制禁用 checkpoint（默认 None 会继承父图
+      saver，污染父 thread 的 checkpoint store）。
+    """
+    sub = StateGraph(SpecialistState)
+    sub.add_node("agent", agent_node, input_schema=SpecialistState)
+    sub.add_node("check_approval", check_approval_node, input_schema=SpecialistState)
+    sub.add_node("tools", tool_node, input_schema=SpecialistState)
+    sub.add_node("reflect", reflect_node, input_schema=SpecialistState)
+    sub.add_node("track_failures", track_failures, input_schema=SpecialistState)
+    sub.set_entry_point("agent")
+    sub.add_conditional_edges(
+        "agent", lambda s: _should_continue(s),
+        {"tools": "check_approval", "reflect": "reflect", "__end__": END},
+    )
+    sub.add_conditional_edges(
+        "check_approval", lambda s: _route_after_approval(s),
+        {"tools": "tools", "agent": "agent"},
+    )
+    sub.add_edge("tools", "track_failures")
+    sub.add_edge("track_failures", "agent")
+    sub.add_edge("reflect", "agent")
+    return sub.compile(checkpointer=False)
 
 
 def _build_tool_catalog() -> str:
@@ -506,6 +644,8 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
         full_prompt += f"\n\n{context_summary}"
 
     MAX_ITERATIONS = 30  # Agent 单次对话的最大思考-行动轮数
+    SUBAGENT_MAX_ITERATIONS = 10  # 子代理（specialist 子图）单次委派的最大思考-行动轮数
+    _subgraph_active = {"on": False}  # 子图执行标记（可变容器，避免闭包 nonlocal 复杂化）
 
     async def call_model(state: AgentState) -> dict:
         # ── 迭代上限保护（防止无限循环）──
@@ -574,7 +714,11 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
                 logger.debug("Conversation summarized: %d chars", len(summary))
 
         # ── RPA 工具按需注入 ──
-        if intent == "rpa" or _history_has_rpa_calls(messages):
+        if _subgraph_active["on"]:
+            # 子代理不注入 RPA 工具：RPA 属高风险、需人工审批，由主代理
+            # general 在子图返回后经现有审批链路执行。跳过逐轮 Flash 分类，省成本。
+            need_rpa = False
+        elif intent == "rpa" or _history_has_rpa_calls(messages):
             need_rpa = True
         elif user_text:
             need_rpa = await _classify_needs_rpa(user_text)
@@ -904,6 +1048,29 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
         results = await _asyncio.gather(*coroutines)
         return {"messages": list(results)}
 
+    async def sub_agent_node(state: AgentState) -> dict:
+        """子代理 LLM 节点（specialist 子图内复用 call_model 的思考-行动循环）。
+
+        职责：
+        - 置位 _subgraph_active，让 call_model 跳过 RPA 按需注入（子代理不绑 RPA 工具）。
+        - 子代理独立迭代上限保护（SUBAGENT_MAX_ITERATIONS），超限强制终止并返回封顶提示，
+          避免单次委派长时间占用主线程。
+        """
+        iteration = state.get("iteration_count", 0)
+        if iteration >= SUBAGENT_MAX_ITERATIONS:
+            logger.warning("子代理达到最大迭代次数 %d，强制终止", SUBAGENT_MAX_ITERATIONS)
+            return {
+                "messages": [AIMessage(content=(
+                    f"已达到子代理处理上限（{SUBAGENT_MAX_ITERATIONS}轮思考-行动）。"
+                    "以下为阶段性结果；如需继续，可由主代理接手处理。"
+                ))],
+            }
+        _subgraph_active["on"] = True
+        try:
+            return await call_model(state)
+        finally:
+            _subgraph_active["on"] = False
+
     tool_catalog_text = _build_tool_catalog()
 
     # ── 意图分类 + 工具评分节点（Flash）──
@@ -976,14 +1143,7 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
         return {"intent": intent, "selected_tools": valid_tools, "needs_rag": needs_rag}
 
     # ── Supervisor 节点（多 Agent 协作）──
-
-    def _route_after_supervisor(state: AgentState) -> Literal["planner", "agent"]:
-        """Supervisor 后路由：有 specialist 任务 → planner 先规划，否则直接 agent。"""
-        specialist = state.get("specialist", "")
-        task = state.get("specialist_task", "")
-        if specialist and task:
-            return "planner"
-        return "agent"
+    # 路由函数 _route_after_supervisor 已在模块级定义（真 specialist → run_specialist 子图）
 
     async def supervisor_node(state: AgentState) -> dict:
         """Supervisor 节点：分析复杂任务并委派给专业子 Agent。
@@ -1054,11 +1214,19 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
             specialist, display, reason, len(sub_tasks),
         )
 
-        return {
+        result = {
             "specialist": specialist,
             "specialist_task": task_text,
             "specialist_history": history,
         }
+        # 真子代理（走子图）→ 发射"子代理开始"瞬态标记，前端显示运行中 chip
+        if specialist in SUBAGENT_NAMES:
+            result["specialist_started"] = {
+                "specialist": specialist,
+                "name": display,
+                "icon": sp.icon if sp else "",
+            }
+        return result
 
     # ── RAG 检索节点（独立节点，可被 checkpoint 追踪和独立重试）──
 
@@ -1606,6 +1774,90 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
             logger.warning("Structured output conversion failed: %s", exc)
             return {"structured_response": {"response_type": "text", "content": final_text}}
 
+    # ── 子代理子图（真 Sub-Agent）+ run_specialist 父节点 ──
+    # 复用同一批节点闭包（call_model/dynamic_tool_node/reflect_node/_track_failures），
+    # 独立编译无 checkpointer 的子图，由 run_specialist 命令式 ainvoke 执行。
+
+    _subgraph = build_specialist_subgraph(
+        agent_node=sub_agent_node,
+        tool_node=dynamic_tool_node,
+        reflect_node=reflect_node,
+        track_failures=_track_failures,
+        check_approval_node=sub_check_approval,
+    )
+
+    async def run_specialist(state: AgentState) -> dict:
+        """run_specialist 父节点：命令式执行 specialist 子图，合并结果回父 state。
+
+        - 子图无 checkpointer、串行执行；报告以预构造 AIMessage 追加进父 messages，
+          经 stream_mode=["messages"] 自动流式发射到前端。
+        - 子代理 session_costs 独立累计，完成后 _merge_session_costs 合并进父 state。
+        - 异常不崩溃：捕获后返回失败报告 + status="failed"，主代理以 general 收尾。
+        """
+        specialist = state.get("specialist", "")
+        task = state.get("specialist_task", "")
+        sp = get_specialist(specialist)
+        display = sp.display_name if sp else specialist
+        icon = sp.icon if sp else ""
+
+        sub_input = {
+            "messages": [HumanMessage(content=task or "请完成委派的任务")],
+            "specialist": specialist,
+            "user_role": state.get("user_role", "viewer"),
+            "intent": "complex",
+            "selected_tools": [],
+            "needs_rag": False,
+            "session_costs": {},
+            "iteration_count": 0,
+            "tool_failures": 0,
+            "tool_retries": 0,
+            "conversation_summary": "",
+            "denied_tool_calls": [],
+        }
+
+        sub_cost: dict = {}
+        status = "failed"
+        try:
+            result = await _subgraph.ainvoke(sub_input, config={"recursion_limit": 60})
+            sub_cost = result.get("session_costs") or {}
+            report = _extract_subagent_report(result.get("messages", []))
+            status = "done" if report else "failed"
+            report = report or "子代理未产出有效报告，请向用户说明并询问是否需要重试。"
+        except Exception as exc:
+            logger.exception("子代理 '%s' 执行失败: %s", specialist, exc)
+            report = (
+                f"子代理（{display}）执行时出现异常，未能完成任务。\n"
+                f"错误信息：{str(exc)[:500]}\n"
+                "请告知用户并询问是否需要重试。"
+            )
+
+        # 合并子代理成本到父 session_costs
+        _merged = _merge_session_costs(state.get("session_costs") or {}, sub_cost)
+
+        return {
+            "messages": [AIMessage(
+                content=report,
+                additional_kwargs={"_node": "run_specialist", "_specialist": specialist},
+            )],
+            "specialist_results": [{
+                "specialist": specialist,
+                "task": task,
+                "status": status,
+                "report": report,
+                "cost": sub_cost,
+            }],
+            "specialist_report": {
+                "specialist": specialist,
+                "name": display,
+                "icon": icon,
+                "report": report,
+            },
+            "specialist": "general",     # 清空委派，主代理以 general 收尾（可再走审批执行高风险操作）
+            "specialist_task": "",
+            "session_costs": _merged,
+            "last_turn_cost": sub_cost,
+        }
+
     # ── 图拓扑 ──
 
     graph = StateGraph(AgentState)
@@ -1621,6 +1873,7 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
     graph.add_node("search_rag", search_rag_node)
     graph.add_node("plan_check", plan_check_node)
     graph.add_node("replan", replan_node)
+    graph.add_node("run_specialist", run_specialist)
     graph.add_node("finalize", finalize_node)
 
     # 入口 → 意图分类
@@ -1636,12 +1889,14 @@ async def build_agent(context_summary: str = "") -> CompiledStateGraph:
         "search_rag", _route_after_rag,
         {"supervisor": "supervisor", "agent": "agent"},
     )
-    # supervisor → planner（规划后再执行）
+    # supervisor → run_specialist（真子代理子图）| planner（规划后再执行）| agent
     graph.add_conditional_edges(
         "supervisor", _route_after_supervisor,
-        {"planner": "planner", "agent": "agent"},
+        {"run_specialist": "run_specialist", "planner": "planner", "agent": "agent"},
     )
     graph.add_edge("planner", "agent")
+    # 子图执行完成后，主代理以 general 收尾（可基于报告继续对话 / 触发审批执行高风险操作）
+    graph.add_edge("run_specialist", "agent")
     # agent → 审批门控 / 反思 / 结构化输出
     graph.add_conditional_edges(
         "agent", _should_continue,

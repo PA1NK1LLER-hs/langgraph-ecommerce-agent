@@ -270,6 +270,32 @@ function connect(threadId?: string) {
           }
         }
         break
+      case 'specialist_started': {
+        // 真子代理开始执行：挂一个"运行中"的 specialist chip（脉冲动画 + 可展开）
+        ensureAssistant().tools!.push({
+          name: d.name || d.specialist,
+          tag: tagForTool('specialist'),
+          status: 'running',
+          expanded: true,
+        })
+        scrollDown()
+        break
+      }
+      case 'specialist_result': {
+        // 子代理子图执行完成：把对应 chip 标记为 done + 附报告摘要（正文已由 text 事件流式输出）
+        const tools = ensureAssistant().tools!
+        const chipName = d.name || d.specialist
+        const chip = tools.find(c => c.name === chipName && c.status === 'running')
+        const summary = d.report.slice(0, 200)
+        if (chip) {
+          chip.status = 'done'
+          chip.result = summary
+        } else {
+          tools.push({ name: chipName, tag: tagForTool('specialist'), status: 'done', result: summary })
+        }
+        scrollDown()
+        break
+      }
       case 'done':
         flushRender()  // 收尾渲染最终 markdown
         currentAssistant = null

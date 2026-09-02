@@ -20,6 +20,8 @@ export type WSEventType =
   | 'done'
   | 'approval_required'
   | 'structured_output'
+  | 'specialist_started'
+  | 'specialist_result'
 
 // ── WebSocket 事件载荷 ──
 export interface WSThreadId { type: 'thread_id'; content: string }
@@ -39,6 +41,19 @@ export interface WSApprovalRequired {
   message: string
 }
 export interface WSStructuredOutput { type: 'structured_output'; content: StructuredResponse }
+export interface WSSpecialistStarted {
+  type: 'specialist_started'
+  specialist: string
+  name: string
+  icon: string
+}
+export interface WSSpecialistResult {
+  type: 'specialist_result'
+  specialist: string
+  name: string
+  icon: string
+  report: string
+}
 
 // ── 结构化响应类型（与后端 Pydantic Schema 对齐）──
 export type StructuredResponse =
@@ -128,6 +143,8 @@ export type WSEvent =
   | WSDone
   | WSApprovalRequired
   | WSStructuredOutput
+  | WSSpecialistStarted
+  | WSSpecialistResult
 
 export interface WSAuthOk { type: 'auth_ok'; content: boolean }
 
@@ -166,6 +183,12 @@ export function parseWSEvent(raw: unknown): WSEvent | WSAuthOk | null {
       return Array.isArray(d.calls) ? (d as unknown as WSApprovalRequired) : null
     case 'structured_output':
       return d.content !== undefined ? (d as unknown as WSStructuredOutput) : null
+    case 'specialist_started':
+      return typeof d.specialist === 'string' ? (d as unknown as WSSpecialistStarted) : null
+    case 'specialist_result':
+      return typeof d.specialist === 'string' && typeof d.report === 'string'
+        ? (d as unknown as WSSpecialistResult)
+        : null
     case 'auth_ok':
       return { type: 'auth_ok', content: d.content === true }
     default:

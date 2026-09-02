@@ -4,7 +4,7 @@
  * 搜索 / 代码 / RPA / 记忆。匹配顺序有意为之：RPA 先于搜索，
  * 避免 'browser' 被 'browse' 抢先归类为搜索。
  */
-export type ToolTagKey = 'search' | 'code' | 'rpa' | 'memory'
+export type ToolTagKey = 'search' | 'code' | 'rpa' | 'memory' | 'specialist'
 
 export interface ToolTag {
   key: ToolTagKey
@@ -24,6 +24,9 @@ export function tagForTool(name: string): ToolTag | null {
   }
   if (/(memory|memories|recall)/.test(n)) {
     return { key: 'memory', label: '记忆' }
+  }
+  if (/(specialist|researcher|coder|analyst)/.test(n)) {
+    return { key: 'specialist', label: '子代理' }
   }
   return null
 }

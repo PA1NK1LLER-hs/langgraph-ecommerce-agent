@@ -205,6 +205,28 @@ async def _send_node_output(websocket: WebSocket, node_name: str, node_output: d
     if not isinstance(node_output, dict):
         return
 
+    # ── 子代理事件（真 Sub-Agent）──
+    # supervisor 委派 → specialist_started（前端显示"研究员 开始执行"运行中 chip）
+    started = node_output.get("specialist_started")
+    if started and isinstance(started, dict):
+        await _safe_send(websocket, {
+            "type": "specialist_started",
+            "specialist": started.get("specialist", ""),
+            "name": started.get("name", ""),
+            "icon": started.get("icon", ""),
+        })
+
+    # run_specialist 子图执行完成 → specialist_result（前端把 chip 标记为完成 + 摘要）
+    sub_report = node_output.get("specialist_report")
+    if sub_report and isinstance(sub_report, dict):
+        await _safe_send(websocket, {
+            "type": "specialist_result",
+            "specialist": sub_report.get("specialist", ""),
+            "name": sub_report.get("name", ""),
+            "icon": sub_report.get("icon", ""),
+            "report": (sub_report.get("report", "") or "")[:2000],
+        })
+
     # ── 结构化输出事件 ──
     if node_output.get("structured_response"):
         await _safe_send(websocket, {

@@ -18,13 +18,13 @@
 ┌──────────────────────────▼──────────────────────────────────────┐
 │                    LangGraph StateGraph                          │
 │                                                                  │
-│  classify_intent → supervisor → planner → agent → tools          │
-│       │                 │          │         │                   │
-│       ▼                 ▼          ▼         ▼                   │
-│  query_rewrite    specialists  replan  check_approval            │
-│       │            (4 types)            (Human-in-Loop)          │
-│       ▼                                                        │
-│  search_rag ─────────────────────────────────────────────────   │
+│  classify_intent → supervisor → run_specialist → agent → tools   │
+│       │                 │  │            │         │              │
+│       ▼                 │  ▼            ▼         ▼              │
+│  query_rewrite       planner     子图独立执行    check_approval   │
+│       │             (委派后规划) (researcher/   (Human-in-Loop)   │
+│       ▼                 │        coder/analyst)                  │
+│  search_rag ────────────┴───────────► agent ─────────────────   │
 │                                                                  │
 │  Flash LLM: 意图分类 / 查询改写 / 摘要                            │
 │  Pro LLM:    推理 / 规划 / 工具调用 / 代码生成                      │
@@ -44,7 +44,7 @@
 - **双模型架构**：Flash 模型处理意图分类、查询改写、对话摘要；Pro 模型处理复杂推理和工具调用（`LLM_FLASH_MODEL` / `LLM_MODEL` 可分别配置）
 - **意图路由**：自动识别 8 种意图（闲聊/知识检索/联网搜索/文件操作/代码执行/RPA/时间/复杂任务），跳过不必要的处理节点；RPA 类意图按需惰性挂载 MCP 工具
 - **Plan-Execute-Replan**：复杂任务自动生成结构化执行计划，失败后自动重新规划
-- **Supervisor 模式**：跨领域任务自动委派给专业子 Agent（研究员/代码专家/数据分析师/通用助手），每个子 Agent 有独立工具子集与专属提示词
+- **Supervisor 模式（真 Sub-Agent）**：跨领域任务自动委派给专业子 Agent（研究员/代码专家/数据分析师），委派后由父图 `run_specialist` 节点**命令式执行一张独立编译的 LangGraph 子图**（无 checkpointer、串行），子代理在子图内独立跑完自己的思考-工具循环，最终报告合并回主 state 并以 AI 消息流式输出；通用助手（general）保持单循环。子代理内高风险工具（代码执行/文件修改/RPA）**不触发中断**，由子代理在报告中标注待审批操作，主代理以 general 身份经现有审批弹窗执行——审批链路与安全性不变。前端收到 `specialist_started`（运行中）与 `specialist_result`（完成摘要）事件，以工具 chip 展示子代理执行过程
 - **Human-in-the-Loop**：高风险操作（代码执行、文件修改）自动触发审批中断，支持 WebSocket 实时审批；审批通过后仍有 RBAC 工具级守卫，代码进入 Docker 沙箱执行
 - **命令级执行策略**：`exec_policy.py` 提供前缀规则引擎（借鉴 Codex execpolicy），对 shell 命令做 allow/prompt/forbidden 三级裁决，是工具名审批之外的第二道闸
 - **上下文管理**：`context_budget.py` 提供 token 预算估算、摘要去重、噪声/图片剥离，长对话自动压缩为结构化摘要，防止上下文溢出；`tool_get_context_remaining` 元认知工具可查看剩余预算
@@ -221,7 +221,8 @@ cd frontend && npm run build && cd ..
 langgraph-agent/
 ├── src/
 │   ├── agent/            # LangGraph 图、工具、MCP、审批、摘要
-│   │   ├── graph.py      # 核心 StateGraph（13 节点）
+│   │   ├── graph.py      # 核心 StateGraph（14 节点 + specialist 子图）
+│   │   ├── state.py      # AgentState / SpecialistState 状态定义
 │   │   ├── core.py       # 系统提示词 + 核心工具
 │   │   ├── specialists.py # 多 Agent（研究员/代码/数据分析/通用）
 │   │   ├── summarizer.py # 对话摘要器 + 上下文压缩
@@ -273,6 +274,9 @@ pytest tests/ -v
 
 # 跳过集成测试
 pytest tests/ -v --ignore=tests/test_integration.py
+
+# 真 Sub-Agent 子图专项（成本合并/报告提取/路由/审批门控/子图行为）
+pytest tests/test_subagent.py -v
 ```
 
 ### 验证脚本
