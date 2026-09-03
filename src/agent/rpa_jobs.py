@@ -18,12 +18,14 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from langchain_core.tools import tool
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from .progress import CURRENT_THREAD_ID  # 提交/查询时记录所在对话线程（结果回流）
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,22 @@ def _new_job_id() -> str:
     return "rpa-" + uuid.uuid4().hex[:12]
 
 
+def _env_int(name: str, default: int) -> int:
+    """读取整型环境变量，缺失/非法时回退默认值（带默认值的配置项约定）。"""
+    try:
+        return int(os.getenv(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """读取秒数环境变量（允许小数，便于测试用小超时）。非法时回退默认值。"""
+    try:
+        return float(os.getenv(name, "") or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 # ── session 工厂（测试可替换为内存 sqlite sessionmaker）──
 _session_factory = None  # type: ignore[var-annotated]
 
@@ -75,6 +93,7 @@ def _job_to_dict(job) -> dict:
         "status": job.status,
         "error": job.error,
         "result": job.result,
+        "main_thread_id": job.main_thread_id,
         "created_at": _iso(job.created_at),
         "started_at": _iso(job.started_at),
         "finished_at": _iso(job.finished_at),
@@ -90,8 +109,12 @@ async def create_rpa_job(
     job_type: str,
     params: dict,
     created_by: int | None = None,
+    main_thread_id: str | None = None,
 ) -> dict:
-    """插入一个 queued 任务，返回 job 摘要（含 job_id）。"""
+    """插入一个 queued 任务，返回 job 摘要（含 job_id）。
+
+    main_thread_id：提交时所在的对话线程（结果回流用，可空）。
+    """
     from api.models import RpaJob
 
     if job_type not in JOB_TOOL_MAP:
@@ -102,6 +125,7 @@ async def create_rpa_job(
         params=json.dumps(params, ensure_ascii=False),
         status=STATUS_QUEUED,
         created_by=created_by,
+        main_thread_id=main_thread_id,
     )
     session.add(job)
     await session.commit()
@@ -162,6 +186,20 @@ async def get_rpa_job(session: AsyncSession, job_id: str) -> dict | None:
     return _job_to_dict(job) if job is not None else None
 
 
+async def get_latest_rpa_job_by_thread(session: AsyncSession, thread_id: str) -> dict | None:
+    """按对话线程取最近提交的一条 RPA 任务（结果回流：无参 get_rpa_job_status 用）。"""
+    from api.models import RpaJob
+
+    stmt = (
+        select(RpaJob)
+        .where(RpaJob.main_thread_id == thread_id)
+        .order_by(RpaJob.created_at.desc(), RpaJob.id.desc())
+        .limit(1)
+    )
+    job = (await session.execute(stmt)).scalar_one_or_none()
+    return _job_to_dict(job) if job is not None else None
+
+
 async def list_rpa_jobs(
     session: AsyncSession,
     *,
@@ -182,9 +220,13 @@ async def list_rpa_jobs(
 
 async def _submit_job(job_type: str, params: dict) -> dict:
     factory = _get_session_factory()
+    # 记录提交时所在的对话线程（结果回流：用户随后无参 get_rpa_job_status 命中本任务）。
+    # CURRENT_THREAD_ID 由 chat._run_turn 在 agent.astream 前置入同一 asyncio context，
+    # submit 工具经 await tool.ainvoke 同任务执行，contextvar 天然传播。
+    thread_id = CURRENT_THREAD_ID.get() or None
     try:
         async with factory() as session:
-            job = await create_rpa_job(session, job_type, params)
+            job = await create_rpa_job(session, job_type, params, main_thread_id=thread_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("RPA 任务提交失败: %s", job_type)
         return {"status": "error", "message": f"任务提交失败: {exc}"}
@@ -246,6 +288,55 @@ def get_submit_rpa_tools() -> list:
     ]
 
 
+@tool(description="查询 RPA 任务最新状态与结果（结果回流对话）。job_id 留空时自动解析当前对话线程最近提交的 RPA 任务")
+async def get_rpa_job_status(job_id: str = "") -> dict:
+    """查询 RPA 任务状态与结果（只读、低风险、无需审批，viewer+ 可用）。
+
+    供结果回流对话：提交 submit_rpa_* 后，用户问「任务完成了吗 / 结果如何」时，
+    agent 用本工具拉取最新结果整理进回复。两种用法：
+    - job_id 非空：精确查询该任务；
+    - job_id 留空：解析「当前对话线程最近提交的 RPA 任务」——提交那一轮已把线程
+      ID 记在 main_thread_id 上，直接无参调用即可命中。
+
+    Args:
+        job_id: RPA 任务 ID（submit_rpa_* 提交时返回，形如 rpa-xxxxxxxxxxxx）。
+                留空 = 查询当前对话线程最近提交的任务。
+    """
+    factory = _get_session_factory()
+    try:
+        async with factory() as session:
+            if job_id:
+                job = await get_rpa_job(session, job_id)
+            else:
+                thread_id = CURRENT_THREAD_ID.get()
+                if not thread_id:
+                    return {
+                        "status": "not_found",
+                        "message": "未提供 job_id 且当前无对话线程上下文，无法定位任务；请传入 submit_rpa_* 返回的 job_id。",
+                    }
+                job = await get_latest_rpa_job_by_thread(session, thread_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("查询 RPA 任务状态失败")
+        return {"status": "error", "message": f"查询任务状态失败: {exc}"}
+
+    if job is None:
+        return {
+            "status": "not_found",
+            "message": f"未找到 RPA 任务{' ' + job_id if job_id else '（当前对话线程还没有提交过任务）'}。",
+        }
+    result_txt = f"，结果：{job['result']}" if job.get("result") else ""
+    error_txt = f"，错误：{job['error']}" if job.get("error") else ""
+    return {
+        **job,
+        "message": f"RPA 任务 {job['job_id']}（{job['job_type']}）当前状态：{job['status']}{result_txt}{error_txt}",
+    }
+
+
+def get_rpa_query_tools() -> list:
+    """RPA 结果查询工具（只读，挂 core tools，供结果回流对话）。"""
+    return [get_rpa_job_status]
+
+
 # ── 后台调度器 ──
 
 
@@ -287,6 +378,46 @@ async def _requeue_stale_running() -> None:
             logger.info("重置 %d 个残留 running 任务为 queued", result.rowcount)
 
 
+async def _sweep_stale_running(max_age_seconds: int | None = None) -> int:
+    """僵死守护：把超过最大执行时长的 running 任务标记为 failed。
+
+    在调度器 _loop 每轮认领前调用，防止 MCP 挂起/进程僵死把任务永远钉在
+    running（面板一直"进行中"，只有重启才恢复）。max_age 读环境变量
+    RPA_JOB_MAX_RUNTIME_SECONDS，默认 1800。
+
+    策略：started_at 为 NULL 的 running 行**跳过不杀**——认领与写 started_at 在
+    同一事务（claim_next_rpa_job），NULL running 只可能来自「认领瞬间被中断」的
+    极小窗口或手工脏数据，误杀风险大于收益；真正的进程崩溃残留由启动时
+    _requeue_stale_running()（at-least-once）处理。
+
+    Returns:
+        本次清扫命中（标记失败）的行数。
+    """
+    from api.models import RpaJob
+
+    max_age = _env_int("RPA_JOB_MAX_RUNTIME_SECONDS", 1800) if max_age_seconds is None else max_age_seconds
+    if max_age <= 0:
+        return 0
+    cutoff = _now_utc() - timedelta(seconds=max_age)
+    factory = _get_session_factory()
+    async with factory() as session:
+        result = await session.execute(
+            update(RpaJob)
+            .where(RpaJob.status == STATUS_RUNNING)
+            .where(RpaJob.started_at.is_not(None))
+            .where(RpaJob.started_at < cutoff)
+            .values(
+                status=STATUS_FAILED,
+                finished_at=_now_utc(),
+                error=f"任务超过最大执行时长({max_age}s)自动标记失败",
+            )
+        )
+        await session.commit()
+        if result.rowcount:
+            logger.warning("僵死清扫：%d 个 running 任务超 %ds，自动标记 failed", result.rowcount, max_age)
+        return result.rowcount or 0
+
+
 class RpaJobDispatcher:
     """后台调度器：每 2s 认领一个 queued 任务，经 RPA MCP executor 执行，一次一个。"""
 
@@ -323,6 +454,12 @@ class RpaJobDispatcher:
     async def _loop(self) -> None:
         while True:
             try:
+                # 先清扫僵死任务（running 超 RPA_JOB_MAX_RUNTIME_SECONDS 的标 failed），
+                # 释放调度器单队列；再认领新任务。
+                try:
+                    await _sweep_stale_running()
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("僵死清扫异常（可忽略）: %s", exc)
                 await self._dispatch_next()
             except asyncio.CancelledError:
                 break
@@ -357,14 +494,36 @@ class RpaJobDispatcher:
                 "status": "success", "dry_run": True, "job_type": job_type, "params": params,
             }, ensure_ascii=False)
 
-        from agent.mcp_setup import ensure_mcp_for_intent, _mcp_importers
+        timeout = _env_float("RPA_EXEC_TIMEOUT_SECONDS", 1200.0)
+        from agent.mcp_setup import ensure_mcp_for_intent, _mcp_importers, evict_rpa
 
-        await ensure_mcp_for_intent("rpa")
+        # 连接 + 单次工具调用分别超时：RPA_MCP 挂起时若不掐断，会占死调度器单队列，
+        # 后续真实任务全部排队停滞。默认 1200s（20 分钟），大于已知最长合法流程
+        # （三类任务 5~15 分钟）留余量。
+        try:
+            await asyncio.wait_for(ensure_mcp_for_intent("rpa"), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"RPA MCP 连接超时(>{timeout:g}s)，任务已标记失败") from None
         importer = _mcp_importers.get("RPA")
         if importer is None:
             raise RuntimeError("RPA MCP executor 未连接，无法执行任务")
         tool_name = JOB_TOOL_MAP[job_type]
-        result = await importer.call_tool(tool_name, params)
+        try:
+            result = await asyncio.wait_for(importer.call_tool(tool_name, params), timeout=timeout)
+        except asyncio.TimeoutError:
+            # 超时与「合法慢任务」在分钟级不可分辨：不自动杀 executor 进程（stdio
+            # 可后续加"超时连带重启 importer 子进程"止损；HTTP 场景做不到）。只在
+            # error 里提示去面板确认，避免把「已标 failed 但副作用已完成」误当成功。
+            raise RuntimeError(
+                f"RPA 执行超时(>{timeout:g}s)，任务已标记失败；"
+                "请到「RPA 任务」面板确认该任务实际是否已执行，避免重复操作"
+            ) from None
+        except Exception:
+            # 非超时的连接级故障（session 断开 / executor 崩溃）→ 驱逐 RPA 连接并
+            # 进入退避窗口，下个任务到来时自动重建连接（mcp_setup.evict_rpa）。
+            logger.warning("RPA MCP 调用异常，驱逐连接待重建: job_type=%s", job_type, exc_info=True)
+            await evict_rpa()
+            raise
         return _mcp_result_text(result, tool_name)
 
 

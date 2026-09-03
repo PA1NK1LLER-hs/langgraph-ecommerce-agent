@@ -9,7 +9,7 @@ from config import LLM_API_KEY, LLM_BASE_URL
 from rag import async_search_knowledge, async_index_knowledge, async_list_sources
 from skills import get_skill_tools
 from .context_budget import DEFAULT_CONTEXT_WINDOW_TOKENS
-from .rpa_jobs import get_submit_rpa_tools
+from .rpa_jobs import get_submit_rpa_tools, get_rpa_query_tools
 
 
 
@@ -428,6 +428,7 @@ _TOOL_CAPABILITY_MAP: list[tuple[str, str, str]] = [
     ("execute_code", "代码执行", "安全执行 Python/Shell 代码"),
     ("rpa_", "RPA 浏览器", "紫鸟浏览器自动化操作"),
     ("submit_rpa_", "RPA 浏览器", "提交 RPA 批量任务（排队执行，立即返回 job_id）"),
+    ("get_rpa_job_status", "RPA 浏览器", "查询 RPA 任务状态与结果（结果回流对话）"),
 ]
 
 
@@ -583,8 +584,9 @@ def register_mcp_tools(tools: list) -> None:
 def get_core_tools() -> list:
     """返回核心工具列表（不含 skill 工具）。
 
-    含 3 个 RPA 提交工具（submit_rpa_*）：LLM 只产出「哪种任务 + 参数」，
-    提交即返回 job_id，由后台调度器排队执行，绝不阻塞回合。
+    含 3 个 RPA 提交工具（submit_rpa_*）+ 1 个只读查询工具（get_rpa_job_status）：
+    LLM 只产出「哪种任务 + 参数」，提交即返回 job_id，由后台调度器排队执行，
+    绝不阻塞回合；提交后同一线程追问结果时用 get_rpa_job_status 回流。
     """
     return [
         tool_search_knowledge,
@@ -599,6 +601,7 @@ def get_core_tools() -> list:
         tool_describe_image,
         tool_get_context_remaining,
         *get_submit_rpa_tools(),
+        *get_rpa_query_tools(),
     ]
 
 

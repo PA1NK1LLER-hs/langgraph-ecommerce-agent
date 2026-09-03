@@ -75,6 +75,13 @@ RPA 任务单次耗时 5~15 分钟，**绝不阻塞聊天回合**。采用 **DB 
 
 **执行器**：RPA 与后端同一仓库，但运行在**独立 stdio 子进程**（`python -m skills.rpa.mcp_server`），按 RPA 意图惰性拉起、跨任务复用，与聊天回合完全隔离；未来多机部署可用 `MCP_RPA_URL` + `RPA_MCP_TOKEN` 走 HTTP 模式。
 
+#### 可靠性加固
+- **调用/连接超时**：调度器对「连接 + 单次 `call_tool`」分别用 `asyncio.wait_for` 掐超时，防 MCP 挂起占死单队列；超时后任务标 `failed`（error 提示到面板确认实际结果，避免副作用已完成被误当成功）。阈值 `RPA_EXEC_TIMEOUT_SECONDS`（默认 `1200`）。
+- **僵死守护**：调度器每轮认领前执行 `_sweep_stale_running()`，把 `running` 超过 `RPA_JOB_MAX_RUNTIME_SECONDS`（默认 `1800`）且 `started_at` 非空的任务自动标 `failed`，不再只能靠重启恢复。
+- **executor 退避重连**：RPA MCP 连接失败后按 `RPA_MCP_RECONNECT_BACKOFF_SECONDS`（默认 `60`）限频重试——不再"崩一次停摆到重启"。调度器 `call_tool` 遇连接级故障调用 `mcp_setup.evict_rpa()` 驱逐连接进入退避，下个任务自动重建；仅驱逐 RPA（`register=False`，无注册副作用），不影响已注册工具的其它 MCP 服务。
+- **结果回流对话**：提交那一轮自动把 LangGraph 对话线程 ID 写入任务 `main_thread_id`；`get_rpa_job_status` 只读工具（挂在 core tools、viewer+ 可用、无需审批）供用户追问"任务完成了吗/结果如何"时查询——传 `job_id` 精确查，或**无参**自动解析「当前对话线程最近提交的任务」。前端无需为回流做改动。
+- **新增环境变量**：`RPA_EXEC_TIMEOUT_SECONDS`(1200) / `RPA_JOB_MAX_RUNTIME_SECONDS`(1800) / `RPA_MCP_RECONNECT_BACKOFF_SECONDS`(60)。注意：`rpa_jobs` 新增列 `main_thread_id` 走 `Base.metadata.create_all`，**已有开发库需手动 `ALTER TABLE rpa_jobs ADD COLUMN main_thread_id VARCHAR(64)`**（或重建该表）后生效。
+
 ### 安全防护
 - **InputGuard**：Regex + 可选 LLM 二分类检测 Prompt 注入和越狱尝试
 - **OutputGuard**：PII 自动检测与脱敏（手机号/身份证/邮箱/银行卡）

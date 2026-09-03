@@ -84,6 +84,9 @@ class RpaJob(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[int | None] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
+    # 提交时所在的 LangGraph 对话线程 —— 用于结果回流（get_rpa_job_status 无参时
+    # 按 CURRENT_THREAD_ID 解析「本线程最近提交的任务」）。可空：独立提交/旧任务为 NULL。
+    main_thread_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

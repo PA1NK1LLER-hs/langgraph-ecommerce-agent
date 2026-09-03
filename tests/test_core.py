@@ -44,8 +44,8 @@ class TestCreateLLM:
 class TestCoreTools:
     def test_get_core_tools_count(self):
         tools = get_core_tools()
-        # 基础工具 11 + RPA 提交工具 3（submit_rpa_*） = 14
-        assert len(tools) == 14
+        # 基础工具 11 + RPA 提交工具 3（submit_rpa_*）+ RPA 查询工具 1（get_rpa_job_status） = 15
+        assert len(tools) == 15
 
     def test_core_tool_names(self):
         names = [t.name for t in get_core_tools()]
@@ -62,6 +62,11 @@ class TestCoreTools:
         assert "submit_rpa_query_campaign_spend" in names
         assert "submit_rpa_collect_amazon_review" in names
         assert "submit_rpa_update_track_table" in names
+
+    def test_rpa_status_query_tool_present(self):
+        """get_rpa_job_status 挂在 core tools（结果回流对话，只读查询）。"""
+        names = {t.name for t in get_core_tools()}
+        assert "get_rpa_job_status" in names
 
     def test_get_all_tools_includes_core(self):
         core_names = {t.name for t in get_core_tools()}

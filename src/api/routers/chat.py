@@ -14,6 +14,7 @@ from ..deps import get_ws_user, get_user_by_token
 from ..rate_limit import ws_limiter, check_ws_rate
 from ..routers.threads import ensure_thread, auto_title_thread
 from agent.graph import get_agent
+from agent.progress import CURRENT_THREAD_ID
 from agent.utils import build_memory_injection
 from auth.permissions import get_user_role
 from config import display_model_name
@@ -145,6 +146,22 @@ async def _stream_resume(agent, command, config: dict, websocket: WebSocket, thr
 
 
 async def _run_turn(agent, input_state: dict, config: dict, websocket: WebSocket, thread_id: str) -> None:
+    """执行一轮 agent 流式生成并把事件推给前端。
+
+    先把当前对话 thread_id 置入 CURRENT_THREAD_ID contextvar：本函数由 ws_chat
+    经 create_task 在独立 task 运行，与 agent.astream 内所有协程同一 asyncio
+    context，RPA submit/query 工具经 await tool.ainvoke 同任务执行可读到该值，
+    据此记录并解析「本线程最近提交的 RPA 任务」（结果回流链路，见 rpa_jobs）。
+    回合结束在 finally 复位，避免泄漏到下一轮。
+    """
+    token = CURRENT_THREAD_ID.set(thread_id)
+    try:
+        await _run_turn_impl(agent, input_state, config, websocket, thread_id)
+    finally:
+        CURRENT_THREAD_ID.reset(token)
+
+
+async def _run_turn_impl(agent, input_state: dict, config: dict, websocket: WebSocket, thread_id: str) -> None:
     """执行一轮 agent 流式生成并把事件推给前端。
 
     发送失败（客户端断连）不中断流消费：图必须运行到完成，
